@@ -1,0 +1,5 @@
+ffmpeg -i data/input.mp3 -ar 16000 -ac 1 output.wav
+ffmpeg -i data/input.mp3 -ar 16000 -ac 1 -t 300 output.wav
+ffmpeg -ss 00:01:00 -to 00:06:00 -i data/input.mp3 -ar 16000 -ac 1 output.wav
+
+ffmpeg -ss 00:11:20 -to 00:16:20 -i 'data/2 personal_loan.aac' -ar 16000 -ac 1 '2 personal_loan.wav'

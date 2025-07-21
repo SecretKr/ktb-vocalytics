@@ -1,0 +1,10 @@
+torch
+pandas
+python-dotenv
+pyannote.audio
+transformers
+pydub
+torchaudio
+google-auth
+google-auth-oauthlib
+google-api-python-client

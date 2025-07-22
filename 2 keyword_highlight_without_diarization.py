@@ -8,8 +8,8 @@ from google.auth.transport.requests import Request
 
 # === Config ===
 SCOPES = ['https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/drive.file']
-# CSV files
-TRANSCRIPT_FILE = 'transcript/transcript.csv'
+# TXT files
+TRANSCRIPT_FILE = 'transcript/transcript.txt'
 KEYWORDS_FILE = 'keywords/personal_loan.csv'
 DOC_TITLE = 'Transcript with Highlights'
 
@@ -30,11 +30,9 @@ def authenticate_google_docs():
 
 # === Step 2: Load and flatten transcript ===
 def load_transcript(file_path):
-    with open(file_path, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        chunks = [row['text'] for row in reader]
-        full_text = ' '.join(chunks)
-    return ' ' + full_text
+    with open(file_path, 'r', encoding='utf-8') as f:
+        full_text = f.read()
+    return ' ' + full_text.strip()
 
 # === Step 3: Load keyword sequences ===
 def load_keyword_patterns(file_path):

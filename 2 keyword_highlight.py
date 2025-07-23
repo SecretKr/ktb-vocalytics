@@ -31,7 +31,7 @@ def load_transcript(file_path):
             full_text = f.read()
     else:
         raise ValueError(f"Unsupported file type: {file_extension}. Only .csv and .txt are supported.")
-    return ' ' + full_text
+    return full_text
 
 # === Step 2: Load keyword sequences ===
 def load_keyword_patterns(file_path):
@@ -127,11 +127,6 @@ def create_docx_and_highlight(full_text, keyword_groups):
                 if (keyword_string, rgb_color) not in data["found_words"]:
                     data["found_words"].append((keyword_string, rgb_color))
 
-                # This is a simplified highlighting. For accurate highlighting,
-                # we need to manipulate runs, which is more complex.
-                # This approach will not work as intended with python-docx's run structure.
-                # A better approach is to split the paragraph text and apply highlighting to runs.
-    
     # Re-creating the paragraph with highlighted runs
     document.paragraphs[-1].clear() # Clear the plain text paragraph
     

@@ -6,18 +6,31 @@ from docx.shared import RGBColor
 from docx.enum.text import WD_COLOR_INDEX
 
 # === Config ===
-TRANSCRIPT_FILE = 'transcript/transcript.csv'
-KEYWORDS_FILE = 'keywords/personal_loan.csv'
+TRANSCRIPT_FILE = 'transcript/transcript_personal_loan.csv' # CSV or TXT file
+KEYWORDS_FILE = 'keywords/personal_loan.csv' # CSV file
+GROUP_NAME_COL = 1 # Column index for group name in keywords CSV
+COLOR_COL = 12 # Column index for color in keywords CSV
+KEYWORD_START_COL = 3 # Starting column index for keywords in keywords CSV
+KEYWORD_END_COL = 11 # Ending column index for keywords in keywords CSV
 
 DOC_TITLE = 'Transcript with Highlights'
 OUTPUT_FILE = 'transcript_with_highlights.docx'
+# ==============
 
 # === Step 1: Load and flatten transcript ===
 def load_transcript(file_path):
-    with open(file_path, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        chunks = [row['text'] for row in reader]
-        full_text = ' '.join(chunks)
+    _, file_extension = os.path.splitext(file_path)
+    full_text = ''
+    if file_extension.lower() == '.csv':
+        with open(file_path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            chunks = [row['text'] for row in reader]
+            full_text = ' '.join(chunks)
+    elif file_extension.lower() == '.txt':
+        with open(file_path, 'r', encoding='utf-8') as f:
+            full_text = f.read()
+    else:
+        raise ValueError(f"Unsupported file type: {file_extension}. Only .csv and .txt are supported.")
     return ' ' + full_text
 
 # === Step 2: Load keyword sequences ===
@@ -29,9 +42,9 @@ def load_keyword_patterns(file_path):
         for row in reader:
             if len(row) < 13:
                 continue
-            group_name = row[1].strip()
-            color_hex = row[12].strip()
-            keywords = [w.strip() for w in row[3:7] if w.strip()]
+            group_name = row[GROUP_NAME_COL].strip()
+            color_hex = row[COLOR_COL].strip()
+            keywords = [w.strip() for w in row[KEYWORD_START_COL:KEYWORD_END_COL] if w.strip()]
 
             if not group_name or not keywords:
                 continue

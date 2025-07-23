@@ -30,9 +30,19 @@ def authenticate_google_docs():
 
 # === Step 2: Load and flatten transcript ===
 def load_transcript(file_path):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        full_text = f.read()
-    return ' ' + full_text.strip()
+    _, file_extension = os.path.splitext(file_path)
+    full_text = ''
+    if file_extension.lower() == '.csv':
+        with open(file_path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            chunks = [row['text'] for row in reader]
+            full_text = ' '.join(chunks)
+    elif file_extension.lower() == '.txt':
+        with open(file_path, 'r', encoding='utf-8') as f:
+            full_text = f.read()
+    else:
+        raise ValueError(f"Unsupported file type: {file_extension}. Only .csv and .txt are supported.")
+    return ' ' + full_text
 
 # === Step 3: Load keyword sequences ===
 def load_keyword_patterns(file_path):

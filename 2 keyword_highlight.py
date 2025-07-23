@@ -1,34 +1,18 @@
 import csv
 import re
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-import os.path
-from google.auth.transport.requests import Request
+import os
+from docx import Document
+from docx.shared import RGBColor
+from docx.enum.text import WD_COLOR_INDEX
 
 # === Config ===
-SCOPES = ['https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/drive.file']
-# CSV files
 TRANSCRIPT_FILE = 'transcript/transcript.csv'
 KEYWORDS_FILE = 'keywords/personal_loan.csv'
+
 DOC_TITLE = 'Transcript with Highlights'
+OUTPUT_FILE = 'transcript_with_highlights.docx'
 
-# === Step 1: Google Auth ===
-def authenticate_google_docs():
-    creds = None
-    if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
-    return creds
-
-# === Step 2: Load and flatten transcript ===
+# === Step 1: Load and flatten transcript ===
 def load_transcript(file_path):
     with open(file_path, newline='', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -36,7 +20,7 @@ def load_transcript(file_path):
         full_text = ' '.join(chunks)
     return ' ' + full_text
 
-# === Step 3: Load keyword sequences ===
+# === Step 2: Load keyword sequences ===
 def load_keyword_patterns(file_path):
     keyword_groups = {}
     with open(file_path, newline='', encoding='utf-8') as f:
@@ -61,7 +45,7 @@ def load_keyword_patterns(file_path):
             keyword_string = " ".join(keywords)
             pattern = r'.*?'.join(map(re.escape, keywords))
             try:
-                rgb = hex_to_rgb(color_hex)
+                rgb = hex_to_rgb_tuple(color_hex)
             except ValueError as e:
                 print(f"⚠️ Skipping invalid color for group '{group_name}': {color_hex} ({e})")
                 continue
@@ -70,128 +54,140 @@ def load_keyword_patterns(file_path):
             
     return keyword_groups
 
-def hex_to_rgb(hex_color):
+def hex_to_rgb_tuple(hex_color):
     hex_color = hex_color.lstrip('#')
     if len(hex_color) != 6:
         raise ValueError(f"Invalid hex color: {hex_color}")
-    r = int(hex_color[0:2], 16) / 255.0
-    g = int(hex_color[2:4], 16) / 255.0
-    b = int(hex_color[4:6], 16) / 255.0
-    return {"red": r, "green": g, "blue": b}
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+    return (r, g, b)
 
-# === Step 4: Create Google Doc with highlights ===
-def create_doc_and_highlight(creds, full_text, keyword_groups):
-    docs_service = build('docs', 'v1', credentials=creds)
+def get_closest_wd_color_index(rgb_tuple):
+    color_map = {
+        (0, 0, 0): WD_COLOR_INDEX.BLACK,
+        (0, 0, 255): WD_COLOR_INDEX.BLUE,
+        (0, 255, 0): WD_COLOR_INDEX.BRIGHT_GREEN,
+        (0, 0, 128): WD_COLOR_INDEX.DARK_BLUE,
+        (128, 0, 0): WD_COLOR_INDEX.DARK_RED,
+        (128, 128, 0): WD_COLOR_INDEX.DARK_YELLOW,
+        (192, 192, 192): WD_COLOR_INDEX.GRAY_25,
+        (128, 128, 128): WD_COLOR_INDEX.GRAY_50,
+        (0, 128, 0): WD_COLOR_INDEX.GREEN,
+        (255, 0, 255): WD_COLOR_INDEX.PINK,
+        (255, 0, 0): WD_COLOR_INDEX.RED,
+        (0, 128, 128): WD_COLOR_INDEX.TEAL,
+        (64, 224, 208): WD_COLOR_INDEX.TURQUOISE, # Approximate
+        (128, 0, 128): WD_COLOR_INDEX.VIOLET,
+        (255, 255, 255): WD_COLOR_INDEX.WHITE,
+        (255, 255, 0): WD_COLOR_INDEX.YELLOW,
+    }
 
-    doc = docs_service.documents().create(body={'title': DOC_TITLE}).execute()
-    doc_id = doc['documentId']
+    min_distance = float('inf')
+    closest_wd_color = WD_COLOR_INDEX.YELLOW # Default if no close match
 
-    requests = [{"insertText": {"location": {"index": 1}, "text": full_text}}]
-    docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
+    for wd_rgb, wd_index in color_map.items():
+        distance = sum([(a - b) ** 2 for a, b in zip(rgb_tuple, wd_rgb)]) ** 0.5
+        if distance < min_distance:
+            min_distance = distance
+            closest_wd_color = wd_index
+    return closest_wd_color
 
-    highlight_requests = []
+# === Step 3: Create DOCX with highlights ===
+def create_docx_and_highlight(full_text, keyword_groups):
+    document = Document()
+    document.add_heading(DOC_TITLE, 0)
+    
+    # Add the full text to a paragraph
+    p = document.add_paragraph()
+    p.add_run(full_text)
+
+    # Highlight the text
     for group_name, data in keyword_groups.items():
         for keyword_string, pattern, rgb_color in data["patterns"]:
             for match in pattern.finditer(full_text):
-                start = match.start()
-                end = match.end()
+                start, end = match.start(), match.end()
                 if start == 0 or start == end:
                     continue
-
+                
                 print(f"✅ Match for group '{group_name}': '{match.group()}'")
                 if (keyword_string, rgb_color) not in data["found_words"]:
                     data["found_words"].append((keyword_string, rgb_color))
 
-                highlight_requests.append({
-                    "updateTextStyle": {
-                        "range": {"startIndex": start + 1, "endIndex": end + 1},
-                        "textStyle": {"backgroundColor": {"color": {"rgbColor": rgb_color}}},
-                        "fields": "backgroundColor"
-                    }
-                })
+                # This is a simplified highlighting. For accurate highlighting,
+                # we need to manipulate runs, which is more complex.
+                # This approach will not work as intended with python-docx's run structure.
+                # A better approach is to split the paragraph text and apply highlighting to runs.
+    
+    # Re-creating the paragraph with highlighted runs
+    document.paragraphs[-1].clear() # Clear the plain text paragraph
+    
+    matches = []
+    for group_name, data in keyword_groups.items():
+        for keyword_string, pattern, rgb_color in data["patterns"]:
+            for match in pattern.finditer(full_text):
+                matches.append((match.start(), match.end(), rgb_color))
 
-    if highlight_requests:
-        docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': highlight_requests}).execute()
+    matches.sort()
 
-    insert_summary_table(docs_service, doc_id, keyword_groups, full_text)
+    last_end = 0
+    p = document.paragraphs[-1]
+    for start, end, color in matches:
+        if start > last_end:
+            p.add_run(full_text[last_end:start])
+        
+        run = p.add_run(full_text[start:end])
+        font = run.font
+        # Set text color to black as requested
+        font.color.rgb = RGBColor(0, 0, 0)
+        
+        # Set highlight color (background)
+        font.highlight_color = get_closest_wd_color_index(color)
 
-    print(f'Document created: https://docs.google.com/document/d/{doc_id}/edit')
+        last_end = end
+    
+    if last_end < len(full_text):
+        p.add_run(full_text[last_end:])
+
+    insert_summary_table(document, keyword_groups)
+
+    document.save(OUTPUT_FILE)
+    print(f'Document created: {os.path.abspath(OUTPUT_FILE)}')
     return keyword_groups
 
-def insert_summary_table(docs_service, doc_id, summary_data, full_text):
-    requests = [
-        {'insertText': {'location': {'index': len(full_text) + 1}, 'text': '\n\nMatch Summary\n'}},
-    ]
-    docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': requests}).execute()
-
-    doc = docs_service.documents().get(documentId=doc_id).execute()
-    end_of_doc_index = doc['body']['content'][-1]['endIndex']
-
+def insert_summary_table(document, summary_data):
+    document.add_page_break()
+    document.add_heading('Match Summary', level=1)
+    
     rows = len(summary_data) + 1
     cols = 3
-    docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': [{
-        'insertTable': {'location': {'index': end_of_doc_index - 1}, 'rows': rows, 'columns': cols}
-    }]}).execute()
+    table = document.add_table(rows=rows, cols=cols)
+    table.style = 'Table Grid'
 
-    doc = docs_service.documents().get(documentId=doc_id, fields='body(content(table))').execute()
-    table_element = next((el for el in reversed(doc['body']['content']) if 'table' in el), None)
-    if not table_element:
-        print("Error: Could not find the inserted summary table.")
-        return
-    table = table_element['table']
-
-    insert_text_requests = []
+    # Headers
     headers = ["Sales Approach", "Found Words", "Status"]
-    for c, header_text in enumerate(headers):
-        cell = table['tableRows'][0]['tableCells'][c]
-        cell_start_index = cell['content'][0]['startIndex']
-        insert_text_requests.append({'insertText': {'location': {'index': cell_start_index}, 'text': header_text}})
+    for i, header in enumerate(headers):
+        table.cell(0, i).text = header
 
+    # Data
     for r, (group, data) in enumerate(summary_data.items(), 1):
-        cell = table['tableRows'][r]['tableCells'][0]
-        cell_start_index = cell['content'][0]['startIndex']
-        insert_text_requests.append({'insertText': {'location': {'index': cell_start_index}, 'text': group}})
+        table.cell(r, 0).text = group
+        
+        # Apply highlighting to found words in the summary table
+        cell = table.cell(r, 1)
+        p_cell = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
+        p_cell.clear() # Clear existing text if any
 
-        found_words_text = ", ".join([word for word, color in data["found_words"]])
-        if found_words_text:
-            cell = table['tableRows'][r]['tableCells'][1]
-            cell_start_index = cell['content'][0]['startIndex']
-            insert_text_requests.append({'insertText': {'location': {'index': cell_start_index}, 'text': found_words_text}})
-
-        cell = table['tableRows'][r]['tableCells'][2]
-        cell_start_index = cell['content'][0]['startIndex']
+        for i, (word, rgb_color) in enumerate(data["found_words"]):
+            if i > 0:
+                p_cell.add_run(", ") # Add comma and space separator
+            run = p_cell.add_run(word)
+            font = run.font
+            font.color.rgb = RGBColor(0, 0, 0) # Text color black
+            font.highlight_color = get_closest_wd_color_index(rgb_color)
+        
         status = "Found" if data["found_words"] else "Not Found"
-        insert_text_requests.append({'insertText': {'location': {'index': cell_start_index}, 'text': status}})
-
-    if insert_text_requests:
-        docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': list(reversed(insert_text_requests))}).execute()
-
-    # Apply formatting
-    doc = docs_service.documents().get(documentId=doc_id, fields='body(content(table))').execute()
-    table_element = next((el for el in reversed(doc['body']['content']) if 'table' in el), None)
-    table = table_element['table']
-
-    style_requests = []
-    for r, (group, data) in enumerate(summary_data.items(), 1):
-        if data["found_words"]:
-            cell = table['tableRows'][r]['tableCells'][1]
-            cell_start_index = cell['content'][0]['startIndex']
-            
-            current_pos = 0
-            for i, (word, color) in enumerate(data["found_words"]):
-                start_index = cell_start_index + current_pos
-                end_index = start_index + len(word)
-                style_requests.append({
-                    "updateTextStyle": {
-                        "range": {"startIndex": start_index, "endIndex": end_index},
-                        "textStyle": {"backgroundColor": {"color": {"rgbColor": color}}},
-                        "fields": "backgroundColor"
-                    }
-                })
-                current_pos += len(word) + 2 # +2 for the ", "
-
-    if style_requests:
-        docs_service.documents().batchUpdate(documentId=doc_id, body={'requests': style_requests}).execute()
+        table.cell(r, 2).text = status
 
 def print_summary_table(summary_data):
     print("\n=== Match Summary by Group ===")
@@ -209,8 +205,7 @@ def print_summary_table(summary_data):
 
 # === Run ===
 if __name__ == '__main__':
-    creds = authenticate_google_docs()
     full_text = load_transcript(TRANSCRIPT_FILE)
     keyword_groups = load_keyword_patterns(KEYWORDS_FILE)
-    summary_result = create_doc_and_highlight(creds, full_text, keyword_groups)
+    summary_result = create_docx_and_highlight(full_text, keyword_groups)
     print_summary_table(summary_result)

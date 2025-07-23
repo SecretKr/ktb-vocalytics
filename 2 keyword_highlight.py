@@ -12,6 +12,7 @@ GROUP_NAME_COL = 1 # Column index for group name in keywords CSV
 COLOR_COL = 12 # Column index for color in keywords CSV
 KEYWORD_START_COL = 3 # Starting column index for keywords in keywords CSV
 KEYWORD_END_COL = 11 # Ending column index for keywords in keywords CSV
+MAX_CONTEXT_WINDOW = 100 # Max characters around keywords for context
 
 DOC_TITLE = 'Transcript with Highlights'
 OUTPUT_FILE = 'transcript_with_highlights.docx'
@@ -56,7 +57,8 @@ def load_keyword_patterns(file_path):
                 }
             
             keyword_string = " ".join(keywords)
-            pattern = r'.*?'.join(map(re.escape, keywords))
+            pattern = r'.{0,%d}?' % MAX_CONTEXT_WINDOW
+            pattern = pattern.join(map(re.escape, keywords))
             try:
                 rgb = hex_to_rgb_tuple(color_hex)
             except ValueError as e:
@@ -130,28 +132,50 @@ def create_docx_and_highlight(full_text, keyword_groups):
     # Re-creating the paragraph with highlighted runs
     document.paragraphs[-1].clear() # Clear the plain text paragraph
     
-    matches = []
+    # Collect all matches with their colors
+    all_matches = []
     for group_name, data in keyword_groups.items():
         for keyword_string, pattern, rgb_color in data["patterns"]:
             for match in pattern.finditer(full_text):
-                matches.append((match.start(), match.end(), rgb_color))
+                all_matches.append({'start': match.start(), 'end': match.end(), 'color': rgb_color, 'group': group_name, 'text': match.group()})
+                if (keyword_string, rgb_color) not in data["found_words"]:
+                    data["found_words"].append((keyword_string, rgb_color))
 
-    matches.sort()
+    # Sort matches by start position
+    all_matches.sort(key=lambda x: x['start'])
 
-    last_end = 0
+    # Merge overlapping matches
+    merged_highlights = []
+    if all_matches:
+        current_highlight = all_matches[0]
+        for i in range(1, len(all_matches)):
+            next_highlight = all_matches[i]
+            if next_highlight['start'] < current_highlight['end']: # Overlap
+                # Merge by extending the current highlight's end if the next one goes further
+                current_highlight['end'] = max(current_highlight['end'], next_highlight['end'])
+                # For overlapping highlights, we keep the color of the first highlight encountered.
+                # If a more sophisticated color merging is needed, this logic would change.
+            else:
+                merged_highlights.append(current_highlight)
+                current_highlight = next_highlight
+        merged_highlights.append(current_highlight) # Add the last highlight
+
+    # Re-creating the paragraph with highlighted runs
+    document.paragraphs[-1].clear() # Clear the plain text paragraph
+    
     p = document.paragraphs[-1]
-    for start, end, color in matches:
+    last_end = 0
+    for highlight in merged_highlights:
+        start, end, color = highlight['start'], highlight['end'], highlight['color']
+        
         if start > last_end:
             p.add_run(full_text[last_end:start])
         
         run = p.add_run(full_text[start:end])
         font = run.font
-        # Set text color to black as requested
-        font.color.rgb = RGBColor(0, 0, 0)
-        
-        # Set highlight color (background)
+        font.color.rgb = RGBColor(0, 0, 0) # Text color black
         font.highlight_color = get_closest_wd_color_index(color)
-
+        
         last_end = end
     
     if last_end < len(full_text):

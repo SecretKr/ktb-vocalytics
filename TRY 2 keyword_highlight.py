@@ -5,23 +5,33 @@ import re
 from docx import Document
 from docx.enum.text import WD_COLOR_INDEX
 from docx.shared import RGBColor
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 # === Config ===
-TRANSCRIPT_FILE = 'transcript\debit\สาขาสกลนคร.txt' # CSV or TXT file
-KEYWORDS_FILE = 'keywords\debit_card.csv' # CSV file
+# Please ensure these paths are correct for your environment
+TRANSCRIPT_FILE = r'transcript\debit\H_สาขานากลาง.txt'
+KEYWORDS_FILE = r'keywords\debit_card.csv'
+
 GROUP_NAME_COL = 1 # Column index for group name in keywords CSV
 COLOR_COL = 12 # Column index for color in keywords CSV
 KEYWORD_START_COL = 3 # Starting column index for keywords in keywords CSV
 KEYWORD_END_COL = 11 # Ending column index for keywords in keywords CSV
 MAX_CONTEXT_WINDOW = 100 # Max characters around keywords for context
 
-DOC_TITLE = 'Transcript with Highlights'
-OUTPUT_FILE = 'transcript_with_highlights.docx'
+DOC_TITLE = 'Transcript with Highlights (Fuzzy Matching)'
+OUTPUT_FILE = 'transcript_with_highlights_fuzzy.docx'
+
+
+# Fuzzy Matching Config
+FUZZY_SIMILARITY_THRESHOLD = 60 # Adjust as needed (0-100). Higher means stricter match.
+FUZZY_SCORER = fuzz.WRatio # Use fuzz.ratio for strict sequence, fuzz.WRatio for more flexibility
 # ==============
 
 # === Step 1: Load and flatten transcript ===
 def load_transcript(file_path):
+    """
+    Loads text content from a CSV, TXT, or DOCX file.
+    """
     _, file_extension = os.path.splitext(file_path)
     full_text = ''
     if file_extension.lower() == '.csv':
@@ -32,11 +42,17 @@ def load_transcript(file_path):
     elif file_extension.lower() == '.txt':
         with open(file_path, 'r', encoding='utf-8') as f:
             full_text = f.read()
+    elif file_extension.lower() == '.docx': # Added DOCX handling
+        try:
+            document = Document(file_path)
+            full_text = "\n".join([paragraph.text for paragraph in document.paragraphs])
+        except Exception as e:
+            raise ValueError(f"Error reading DOCX file {file_path}: {e}. Ensure python-docx is installed.")
     else:
-        raise ValueError(f"Unsupported file type: {file_extension}. Only .csv and .txt are supported.")
+        raise ValueError(f"Unsupported file type: {file_extension}. Only .csv, .txt, and .docx are supported.")
     return full_text
 
-# === Step 2: Load keyword sequences ===
+# === Step 2: Load keyword sequences and prepare for fuzzy matching ===
 def load_keyword_patterns(file_path):
     keyword_groups = {}
     with open(file_path, newline='', encoding='utf-8') as f:
@@ -72,6 +88,7 @@ def load_keyword_patterns(file_path):
     return keyword_groups
 
 def hex_to_rgb_tuple(hex_color):
+    """Converts a hex color string to an RGB tuple."""
     hex_color = hex_color.lstrip('#')
     if len(hex_color) != 6:
         raise ValueError(f"Invalid hex color: {hex_color}")
@@ -81,6 +98,7 @@ def hex_to_rgb_tuple(hex_color):
     return (r, g, b)
 
 def get_closest_wd_color_index(rgb_tuple):
+    """Finds the closest WD_COLOR_INDEX for a given RGB tuple."""
     color_map = {
         (0, 0, 0): WD_COLOR_INDEX.BLACK,
         (0, 0, 255): WD_COLOR_INDEX.BLUE,
@@ -110,7 +128,6 @@ def get_closest_wd_color_index(rgb_tuple):
             closest_wd_color = wd_index
     return closest_wd_color
 
-# === Step 3: Create DOCX with highlights ===
 def create_docx_and_highlight(full_text, keyword_groups):
     document = Document()
     document.add_heading(DOC_TITLE, 0)
@@ -119,34 +136,29 @@ def create_docx_and_highlight(full_text, keyword_groups):
     p = document.add_paragraph()
     p.add_run(full_text)
 
-    # Highlight the text
-    for group_name, data in keyword_groups.items():
-        for keyword_string, pattern, rgb_color in data["patterns"]:
-            for match in pattern.finditer(full_text):
-                start, end = match.start(), match.end()
-                if start == 0 or start == end:
-                    continue
-                
-                print(f"✅ Match for group '{group_name}': '{match.group()}'")
-                if (keyword_string, rgb_color) not in data["found_words"]:
-                    data["found_words"].append((keyword_string, rgb_color))
-
-    # Re-creating the paragraph with highlighted runs
-    document.paragraphs[-1].clear() # Clear the plain text paragraph
-    
-    # Collect all matches with their colors
+    # Collect all matches with their colors (both exact and fuzzy)
     all_matches = []
     for group_name, data in keyword_groups.items():
         for keyword_string, pattern, rgb_color in data["patterns"]:
             for match in pattern.finditer(full_text):
-                all_matches.append({'start': match.start(), 'end': match.end(), 'color': rgb_color, 'group': group_name, 'text': match.group()})
-                if (keyword_string, rgb_color) not in data["found_words"]:
-                    data["found_words"].append((keyword_string, rgb_color))
+                matched_text = match.group()
+                
+                # Check for fuzzy similarity
+                score = FUZZY_SCORER(matched_text.lower(), keyword_string.lower())
+                
+                if score >= FUZZY_SIMILARITY_THRESHOLD:
+                    print(f"✅ Match for group '{group_name}': Original Keyword: '{keyword_string}', Matched Text: '{matched_text}' (Score: {score})")
+                    all_matches.append({'start': match.start(), 'end': match.end(), 'color': rgb_color, 'group': group_name, 'text': matched_text})
+                    if (keyword_string, rgb_color) not in data["found_words"]:
+                        data["found_words"].append((keyword_string, rgb_color))
+
+    # Re-creating the paragraph with highlighted runs
+    document.paragraphs[-1].clear() # Clear the plain text paragraph
 
     # Sort matches by start position
     all_matches.sort(key=lambda x: x['start'])
 
-    # Merge overlapping matches
+    # Merge overlapping highlights
     merged_highlights = []
     if all_matches:
         current_highlight = all_matches[0]
@@ -190,6 +202,7 @@ def create_docx_and_highlight(full_text, keyword_groups):
     return keyword_groups
 
 def insert_summary_table(document, summary_data):
+    """Inserts a summary table of found keywords into the DOCX document."""
     document.add_page_break()
     document.add_heading('Match Summary', level=1)
     
@@ -224,6 +237,7 @@ def insert_summary_table(document, summary_data):
         table.cell(r, 2).text = status
 
 def print_summary_table(summary_data):
+    """Prints a summary table of found keywords to the console."""
     print("\n=== Match Summary by Group ===")
     if not summary_data:
         print("No keyword groups found.")
@@ -239,7 +253,21 @@ def print_summary_table(summary_data):
 
 # === Run ===
 if __name__ == '__main__':
+    # Ensure python-docx library is installed
+    try:
+        from docx import Document
+        from docx.enum.text import WD_COLOR_INDEX
+        from docx.shared import RGBColor
+    except ImportError:
+        print("Error: 'python-docx' library not found. Please install it using: pip install python-docx")
+        exit()
+
+    print(f"Loading transcript from: {TRANSCRIPT_FILE}")
     full_text = load_transcript(TRANSCRIPT_FILE)
+    print(f"Loading keywords from: {KEYWORDS_FILE}")
     keyword_groups = load_keyword_patterns(KEYWORDS_FILE)
+    
+    print("\n--- Starting Highlighting Process ---")
     summary_result = create_docx_and_highlight(full_text, keyword_groups)
+    print("\n--- Highlighting Process Completed ---")
     print_summary_table(summary_result)

@@ -1,9 +1,7 @@
-.DS_Store
-.env
-credentials.json
-token.json
+﻿.conda/
+AI summarize/transcript_with_hightlight/
 data/
-keywords/
-test/
-transcript/
-*.docx
+transcript/debit/
+transcript/example/
+transcript/example_cleaned/
+.env

@@ -1,17 +1,18 @@
-import os
 import io
+import os
 import re
-import torch
-import pandas as pd
-from dotenv import load_dotenv
-from pyannote.audio import Pipeline
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-from pydub import AudioSegment
-import torchaudio
 import time
 
+import pandas as pd
+import torch
+import torchaudio
+from dotenv import load_dotenv
+from pyannote.audio import Pipeline
+from pydub import AudioSegment
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
 # === Input Audio File ===
-audio_file = "data/2 personal_loan.wav"
+audio_file = "\data\2 personal_loan.wav\2 personal_loan.wav"
 
 start_time = time.time()
 if not os.path.exists(audio_file):
@@ -62,6 +63,7 @@ diarization_df = pd.DataFrame(data)
 # === Load ASR Model ===
 print("Loading biodatlab Whisper model...")
 from transformers import logging
+
 logging.set_verbosity_error()  # Reduce warnings
 
 # model_name = "biodatlab/distill-whisper-th-large-v3"
@@ -76,6 +78,7 @@ full_audio = AudioSegment.from_wav(audio_file)
 
 transcribed_segments = []
 for i, row in diarization_df.iterrows():
+    print(f"🔄 Processing segment {i+1}/{len(diarization_df)}: {row['start']:.2f}s - {row['end']:.2f}s")
     start_time_ms = int(row['start'] * 1000)
     end_time_ms = int(row['end'] * 1000)
     segment_audio = full_audio[start_time_ms:end_time_ms]

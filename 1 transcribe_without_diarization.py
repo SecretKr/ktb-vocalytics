@@ -1,20 +1,22 @@
-import os
 import io
+import os
 import re
-import torch
-from dotenv import load_dotenv
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-from pydub import AudioSegment
-import torchaudio
 import time
 
+import torch
+import torchaudio
+from dotenv import load_dotenv
+from pydub import AudioSegment
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
 # === Input Audio File ===
-audio_file = "data/2 personal_loan.wav"
+audio_file = "\data\2 personal_loan.wav\2 personal_loan.wav"
+
+if not os.path.exists(audio_file):
+    raise FileNotFoundError(f"The audio file was not found at: {audio_file}")
 
 # === Start Timer ===
 start_time = time.time()
-if not os.path.exists(audio_file):
-    raise FileNotFoundError(f"The audio file was not found at: {audio_file}")
 
 # === Clean Thai Text ===
 def clean_thai_text(text):
@@ -41,14 +43,18 @@ else:
 # === Load ASR Model ===
 print("Loading biodatlab Whisper model...")
 from transformers import logging
+
 logging.set_verbosity_error()
 
 # model_name = "biodatlab/distill-whisper-th-large-v3"
 # model_name = "biodatlab/whisper-th-large-v3-combined"
 model_name = "biodatlab/whisper-th-large-v3"
-processor = WhisperProcessor.from_pretrained(model_name)
-model = WhisperForConditionalGeneration.from_pretrained(model_name)
-model.to(device_asr)
+try:
+    processor = WhisperProcessor.from_pretrained(model_name, token=hf_token)
+    model = WhisperForConditionalGeneration.from_pretrained(model_name, token=hf_token)
+    model.to(device_asr)
+except Exception as e:
+    raise RuntimeError(f"Failed to load ASR model or processor: {e}")
 
 # === Load Entire Audio File ===
 audio = AudioSegment.from_wav(audio_file)

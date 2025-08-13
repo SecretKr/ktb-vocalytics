@@ -6,3 +6,6 @@ transformers
 pydub
 torchaudio
 python-docx
+fuzzywuzzy[speedup]
+pythainlp
+openai

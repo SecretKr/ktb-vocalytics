@@ -1,7 +1,19 @@
-﻿.conda/
-AI summarize/transcript_with_hightlight/
-data/
-transcript/debit/
-transcript/example/
-transcript/example_cleaned/
-.env
+﻿.env
+.env.*
+*.env
+!.env.template
+.conda/
+
+data/**
+!data/.gitkeep
+keyword/**
+!keyword/.gitkeep
+
+transcript/**
+!transcript/.gitkeep
+
+transcript_with_highlight/**
+!transcript_with_highlight/.gitkeep
+
+transcript_with_highlight_and_ai_summarize/**
+!transcript_with_highlight_and_ai_summarize/.gitkeep

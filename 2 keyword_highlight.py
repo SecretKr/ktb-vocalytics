@@ -3,22 +3,37 @@ import os
 import re
 
 from docx import Document
-from docx.enum.text import WD_COLOR_INDEX
-from docx.shared import RGBColor
-from rapidfuzz import fuzz
+from docx.enum.section import WD_ORIENTATION, WD_SECTION
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt, RGBColor
 
 # === Config ===
-TRANSCRIPT_FILE = 'transcript\debit\สาขาสกลนคร.txt' # CSV or TXT file
-KEYWORDS_FILE = 'keywords\debit_card.csv' # CSV file
-GROUP_NAME_COL = 1 # Column index for group name in keywords CSV
-COLOR_COL = 12 # Column index for color in keywords CSV
-KEYWORD_START_COL = 3 # Starting column index for keywords in keywords CSV
-KEYWORD_END_COL = 11 # Ending column index for keywords in keywords CSV
-MAX_CONTEXT_WINDOW = 100 # Max characters around keywords for context
+PRODUCT_NAME = "debit_card"  # Default product, will be updated dynamically
+TRANSCRIPT_DIR = "C:/Users/Deede/Projects/ktb-vocalytics/transcript"
+KEYWORDS_DIR = "C:/Users/Deede/Projects/ktb-vocalytics/keywords"
+OUTPUT_BASE_DIR = "C:/Users/Deede/Projects/ktb-vocalytics/transcript_with_highlight"
+OUTPUT_AI_BASE_DIR = "C:/Users/Deede/Projects/ktb-vocalytics/transcript_with_highlight_and_ai_summarize"
 
 DOC_TITLE = 'Transcript with Highlights'
-OUTPUT_FILE = 'transcript_with_highlights.docx'
-# ==============
+GROUP_NAME_COL = 1
+COLOR_COL = 12
+KEYWORD_START_COL = 3
+KEYWORD_END_COL = 11
+MAX_CONTEXT_WINDOW = 100
+
+# Dynamically generate file paths based on product name and transcript file name
+def generate_paths(product_name, transcript_filename):
+    transcript_file_path = os.path.join(TRANSCRIPT_DIR, product_name, transcript_filename)
+    keywords_file_path = os.path.join(KEYWORDS_DIR, f"{product_name}.csv")
+    
+    output_dir = os.path.join(OUTPUT_BASE_DIR, product_name)
+    output_file_name = f"transcript_with_highlights_{os.path.splitext(transcript_filename)[0]}.docx"
+    output_file_path = os.path.join(output_dir, output_file_name)
+
+    output_ai_dir = os.path.join(OUTPUT_AI_BASE_DIR, f"{product_name}_final_output")
+    
+    return transcript_file_path, keywords_file_path, output_dir, output_file_path, output_ai_dir
 
 # === Step 1: Load and flatten transcript ===
 def load_transcript(file_path):
@@ -111,13 +126,31 @@ def get_closest_wd_color_index(rgb_tuple):
     return closest_wd_color
 
 # === Step 3: Create DOCX with highlights ===
-def create_docx_and_highlight(full_text, keyword_groups):
+def create_docx_and_highlight(full_text, keyword_groups, output_file_path, output_dir):
     document = Document()
-    document.add_heading(DOC_TITLE, 0)
+
+    # Set page orientation to landscape
+    section = document.sections[0]
+    section.orientation = WD_ORIENTATION.LANDSCAPE
+    section.page_width = Inches(11)
+    section.page_height = Inches(8.5)
+
+    # Set default font and size for the document
+    style = document.styles['Normal']
+    font = style.font
+    font.name = 'Tahoma'
+    font.size = Pt(11)
+
+    # Add main heading
+    heading = document.add_heading(DOC_TITLE, 0)
+    heading.runs[0].font.size = Pt(16)
+    heading.runs[0].font.name = 'Tahoma'
     
     # Add the full text to a paragraph
     p = document.add_paragraph()
-    p.add_run(full_text)
+    run = p.add_run(full_text)
+    run.font.name = 'Tahoma'
+    run.font.size = Pt(11)
 
     # Highlight the text
     for group_name, data in keyword_groups.items():
@@ -185,13 +218,17 @@ def create_docx_and_highlight(full_text, keyword_groups):
 
     insert_summary_table(document, keyword_groups)
 
-    document.save(OUTPUT_FILE)
-    print(f'Document created: {os.path.abspath(OUTPUT_FILE)}')
+    os.makedirs(output_dir, exist_ok=True) # Create output directory if it doesn't exist
+    document.save(output_file_path)
+    print(f'Document created: {os.path.abspath(output_file_path)}')
     return keyword_groups
 
 def insert_summary_table(document, summary_data):
     document.add_page_break()
-    document.add_heading('Match Summary', level=1)
+    
+    heading = document.add_heading('Match Summary', level=1)
+    heading.runs[0].font.size = Pt(16)
+    heading.runs[0].font.name = 'Tahoma'
     
     rows = len(summary_data) + 1
     cols = 3
@@ -201,27 +238,46 @@ def insert_summary_table(document, summary_data):
     # Headers
     headers = ["Sales Approach", "Found Words", "Status"]
     for i, header in enumerate(headers):
-        table.cell(0, i).text = header
+        cell = table.cell(0, i)
+        p_cell = cell.paragraphs[0]
+        run = p_cell.add_run(header)
+        run.bold = True
+        run.font.name = 'Tahoma'
+        run.font.size = Pt(11)
 
     # Data
     for r, (group, data) in enumerate(summary_data.items(), 1):
-        table.cell(r, 0).text = group
+        cell_group = table.cell(r, 0)
+        p_group = cell_group.paragraphs[0] if cell_group.paragraphs else cell_group.add_paragraph()
+        p_group.clear()
+        run_group = p_group.add_run(group)
+        run_group.font.name = 'Tahoma'
+        run_group.font.size = Pt(11)
         
         # Apply highlighting to found words in the summary table
-        cell = table.cell(r, 1)
-        p_cell = cell.paragraphs[0] if cell.paragraphs else cell.add_paragraph()
-        p_cell.clear() # Clear existing text if any
+        cell_words = table.cell(r, 1)
+        p_cell_words = cell_words.paragraphs[0] if cell_words.paragraphs else cell_words.add_paragraph()
+        p_cell_words.clear() # Clear existing text if any
 
         for i, (word, rgb_color) in enumerate(data["found_words"]):
             if i > 0:
-                p_cell.add_run(", ") # Add comma and space separator
-            run = p_cell.add_run(word)
+                run_comma = p_cell_words.add_run(", ") # Add comma and space separator
+                run_comma.font.name = 'Tahoma'
+                run_comma.font.size = Pt(11)
+            run = p_cell_words.add_run(word)
             font = run.font
+            font.name = 'Tahoma'
+            font.size = Pt(11)
             font.color.rgb = RGBColor(0, 0, 0) # Text color black
             font.highlight_color = get_closest_wd_color_index(rgb_color)
         
         status = "Found" if data["found_words"] else "Not Found"
-        table.cell(r, 2).text = status
+        cell_status = table.cell(r, 2)
+        p_status = cell_status.paragraphs[0] if cell_status.paragraphs else cell_status.add_paragraph()
+        p_status.clear()
+        run_status = p_status.add_run(status)
+        run_status.font.name = 'Tahoma'
+        run_status.font.size = Pt(11)
 
 def print_summary_table(summary_data):
     print("\n=== Match Summary by Group ===")
@@ -239,7 +295,16 @@ def print_summary_table(summary_data):
 
 # === Run ===
 if __name__ == '__main__':
-    full_text = load_transcript(TRANSCRIPT_FILE)
-    keyword_groups = load_keyword_patterns(KEYWORDS_FILE)
-    summary_result = create_docx_and_highlight(full_text, keyword_groups)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Highlight keywords in a transcript and generate a DOCX report.")
+    parser.add_argument("--product", required=True, help="Product name (e.g., 'debit_card', 'telesales')")
+    parser.add_argument("--transcript_filename", required=True, help="Name of the transcript file (e.g., 'H_สาขาหนองบัวระเหว.txt')")
+    args = parser.parse_args()
+
+    transcript_file_path, keywords_file_path, output_dir, output_file_path, _ = generate_paths(args.product, args.transcript_filename)
+
+    full_text = load_transcript(transcript_file_path)
+    keyword_groups = load_keyword_patterns(keywords_file_path)
+    summary_result = create_docx_and_highlight(full_text, keyword_groups, output_file_path, output_dir)
     print_summary_table(summary_result)

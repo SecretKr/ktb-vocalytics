@@ -709,7 +709,7 @@ def main():
     parser.add_argument("--input-dir", default="transcript_with_highlight", help="Directory containing input .docx files")
     parser.add_argument("--output-dir", default="transcript_with_highlight_and_ai_summarize", help="Base directory for AI summary output")
     parser.add_argument("--model", default="google/gemma-3-27b-it:free", help="The primary AI model to use")
-    parser.add_argument("--fallback-model", default="mistralai/mixtral-8x7b-instruct", help="Fallback model if the primary fails")
+    parser.add_argument("--fallback-model", default="google/gemma-3-12b-it:free", help="Fallback model if the primary fails")
     args = parser.parse_args()
 
     client = get_openai_client()

@@ -115,18 +115,10 @@ def is_rate_limit_error(e: Exception) -> bool:
     return "429" in str(e)
 
 def extract_json_from_response(text: str) -> Optional[Dict]:
-    """
-    ดึง JSON ที่ 'ใช่' จากคำตอบโมเดล:
-    - ตัด code fences ออก
-    - ลอง parse ตรง ๆ
-    - ถ้าไม่สำเร็จ: แตกทุก {...} เป็น candidate แล้ว 'เลือกก้อนที่ดีที่สุด'
-      โดยให้คะแนนตามโครงสร้างที่เราต้องการ (steps เป็น list ไม่ว่าง + มี summary)
-    """
     if not text:
         return None
-
     s = text.strip()
-    # ตัด ```...``` ออกถ้ามี
+    # ตัด code fences ถ้ามี
     s = re.sub(r"^```[a-zA-Z_]*\s*", "", s).strip()
     s = re.sub(r"\s*```$", "", s).strip()
 
@@ -137,7 +129,7 @@ def extract_json_from_response(text: str) -> Optional[Dict]:
     except Exception:
         pass
 
-    # 2) แตกทุก {...} เป็น candidates
+    # 2) แตกทุก {...} เป็น candidates แล้วเลือกก้อนที่ "เข้ารูป" ที่สุด
     candidates = [m.group(0) for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL)]
     best = None
     best_score = -1
@@ -147,23 +139,18 @@ def extract_json_from_response(text: str) -> Optional[Dict]:
             obj = json.loads(cand)
         except Exception:
             continue
-
-        # ให้คะแนนความเหมาะสม
         score = 0
         steps = obj.get("steps")
-        summary = obj.get("summary")
-        if isinstance(steps, list) and len(steps) > 0:
-            score += 2        # steps เป็น list และไม่ว่าง
-            # เช็คว่า items ข้างในไม่ว่าง
-            # (ไม่บังคับเสมอไป แต่ให้แต้มเพิ่ม)
-            if any(isinstance(st.get("items"), list) and len(st.get("items")) > 0 for st in steps if isinstance(st, dict)):
-                score += 1
-        if isinstance(summary, dict):
+        if isinstance(steps, list):
+            # ให้แต้มตามจำนวน items จริง
+            score += len(steps)
+            # แต้มเพิ่มถ้ามี items ภายใน
+            score += sum(1 for st in steps if isinstance(st, dict) and isinstance(st.get("items"), list) and len(st["items"]) > 0)
+        if isinstance(obj.get("summary"), dict):
             score += 1
-
         if score > best_score:
-            best_score = score
             best = obj
+            best_score = score
 
     return best
 
@@ -198,6 +185,24 @@ def call_ai_model(client: OpenAI, messages: List[Dict[str, Any]], model: str, ma
                 continue
             logging.warning(f"Model {model} error: {e}")
             return None
+
+def retry_force_json(client: OpenAI, base_prompt: str, model_list: List[str]) -> Optional[Dict]:
+    """
+    พยายามเรียกอีกรอบด้วยคำสั่งเข้มงวด: ต้องคืน JSON object เดียวเท่านั้น
+    """
+    strict = (
+        "คำสั่งสำคัญ: ตอบเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นหรือ code fence ใด ๆ นอกเหนือจาก JSON\n"
+        "ห้ามใส่ตัวอย่าง ไม่ต้องอธิบาย\n"
+        "ต้องมี keys: metadata, steps, summary ตาม schema ที่กำหนด"
+    )
+    strict_prompt = strict + "\n\n" + base_prompt
+    for m in model_list:
+        resp = call_ai_model(client, [{"role": "user", "content": strict_prompt}], m)
+        if resp and isinstance(resp.get("steps"), list) and len(resp["steps"]) > 0:
+            resp["_model_used"] = m
+            return resp
+    return None
+
 
 def build_comprehensive_prompt(transcript: str, criteria_data: Dict[str, Any]) -> str:
     """Builds a single, comprehensive prompt for the AI to perform all tasks at once."""
@@ -309,103 +314,41 @@ def compute_scores(report: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[int, Tu
     
     return report, per_step_scores
 
-def normalize_report(report, criteria_data):
-    summary = report.get("summary") or {}
+def normalize_report(report: Dict[str, Any], criteria_data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(report, dict):
+        report = {}
 
-    # กำหนด default
-    summary.setdefault("narrative_reason", "")
-    summary.setdefault("strengths", [])
-    summary.setdefault("improvements", [])
-    summary.setdefault("compliance", {"do": [], "dont": []})
+    # เติม metadata/summary เปล่า ๆ ถ้ายังไม่มี
+    report.setdefault("metadata", {"date": "ไม่ระบุ", "branch": "ไม่ระบุ"})
+    report.setdefault("summary", {
+        "compliance": {"do": [], "dont": []},
+        "narrative_reason": "",
+        "strengths": [],
+        "improvements": []
+    })
 
-    # ถ้า strengths/improvements เป็น string → list
-    for key in ("strengths", "improvements"):
-        val = summary.get(key)
-        if isinstance(val, str):
-            summary[key] = [s.strip() for s in val.split("\n") if s.strip()]
-        elif not isinstance(val, list):
-            summary[key] = []
-
-    # ถ้า compliance.do/dont ไม่ใช่ list → list
-    comp = summary.get("compliance") or {}
-    for k in ("do", "dont"):
-        v = comp.get(k, [])
-        if isinstance(v, str):
-            comp[k] = [s.strip() for s in v.split("\n") if s.strip()]
-        elif not isinstance(v, list):
-            comp[k] = []
-    summary["compliance"] = comp
-
-    report["summary"] = summary
-
-        # --- บังคับ steps ให้เป็น list ---
     steps = report.get("steps")
-    if not isinstance(steps, list):
-        steps = []
-    else:
-        # --- สำคัญ: บังคับ items ของแต่ละ step ให้เป็น 'list' เสมอ ---
-        fixed_steps = []
-        for i, st in enumerate(steps):
-            if not isinstance(st, dict):
-                # โครงสร้าง step แปลก → ข้าม
-                continue
-
-            items = st.get("items", [])
-            # ถ้า items เป็น string → พยายาม parse เป็น JSON ก่อน
-            if isinstance(items, str):
-                parsed = None
-                try:
-                    parsed = json.loads(items)
-                except Exception:
-                    parsed = None
-
-                if isinstance(parsed, list):
-                    items = parsed
-                elif isinstance(parsed, dict):
-                    items = [parsed]
-                else:
-                    # แปลง string (ที่ parse ไม่ได้) ให้เป็น list ว่าง
-                    items = []
-
-            # ถ้า items เป็น dict เดี่ยว → หุ้มเป็น list
-            elif isinstance(items, dict):
-                items = [items]
-
-            # ถ้าไม่ใช่ list → บังคับเป็น list ว่าง
-            elif not isinstance(items, list):
-                items = []
-
-            # optional: ทำความสะอาด structure ของ item แต่ละตัว
-            fixed_items = []
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                ev = it.get("evidence") or {}
-                if isinstance(ev, str):
-                    # พยายาม parse evidence ถ้าเป็น string-JSON
-                    try:
-                        ev_parsed = json.loads(ev)
-                        ev = ev_parsed if isinstance(ev_parsed, dict) else {}
-                    except Exception:
-                        ev = {}
-                elif not isinstance(ev, dict):
-                    ev = {}
-
-                it.setdefault("id", "")
-                it.setdefault("name", "")
-                it.setdefault("status", "")
-                it.setdefault("reason", "")
-                it["evidence"] = ev
-                fixed_items.append(it)
-
-            st.setdefault("step", st.get("step", 0))
-            st.setdefault("title", st.get("title", f"ขั้นตอน {st.get('step', 0)}"))
-            st["items"] = fixed_items
-            fixed_steps.append(st)
-
-        steps = fixed_steps
-
-    report["steps"] = steps
+    if not (isinstance(steps, list) and len(steps) > 0):
+        # สร้าง steps เปล่าจาก criteria
+        steps_new = []
+        for step_no_str, items in criteria_data.get("criteria_by_step", {}).items():
+            step_no = int(step_no_str)
+            # หา title
+            title = next((s.split(')')[1].strip() for s in criteria_data.get("steps", [])
+                    if int(s.split(')')[0].strip()) == step_no), f"ขั้นตอน {step_no}")
+            new_items = []
+            for idx, item in enumerate(items, 1):
+                name = item.get("name", str(item))
+                new_items.append({
+                    "id": f"{step_no}.{idx}",
+                    "name": name,
+                    "status": "",
+                    "reason": "",
+                    "evidence": {"exact": "", "sentence": "", "offset": []}
+                })
+            steps_new.append({"step": step_no, "title": title, "items": new_items})
+        steps_new.sort(key=lambda x: int(x["step"]))
+        report["steps"] = steps_new
 
     return report
 
@@ -822,11 +765,7 @@ def main():
                     report = None
                     for model in models:
                         bar.set_postfix(model=model)
-                        report = call_ai_model(
-                            client,
-                            [{"role": "user", "content": prompt}],
-                            model
-                        )
+                        report = call_ai_model(client, [{"role": "user", "content": prompt}], model)
                         if report:
                             break
                     bar.update(1)
@@ -835,42 +774,38 @@ def main():
                         logging.error(f"All models failed for: {fname}")
                         skip_current_file = True
 
-                if not isinstance(report, dict):
-                    try:
-                        report = json.loads(report)  # แปลง string → dict
-                    except Exception as e:
-                        logging.error(f"❌ JSON parse failed for {fname}: {e}")
-                        skip_current_file = True
-                        continue
+                    if not skip_current_file:
+                        # Normalize ครั้งที่ 1
+                        report = normalize_report(report, criteria_data)
 
-                if not skip_current_file:
-                    logging.info(f"[DEBUG] File {fname} -> steps count: {len(report.get('steps', []))}")
-                    # 4) Score
-                    try:
+                        # ถ้า steps ยังว่างจริง ๆ → ลอง fix-up pass (ยิงอีกรอบแบบเข้มเงียบ ๆ)
+                        steps_count = sum(len(st.get("items", [])) for st in report.get("steps", []) if isinstance(st, dict))
+                        if steps_count == 0:
+                            logging.warning(f"[DEBUG] {fname} → steps still empty, trying fix-up pass...")
+                            repaired = retry_force_json(client, prompt, models)
+                            if repaired:
+                                report = normalize_report(repaired, criteria_data)
+                                logging.info(f"[DEBUG] {fname} → fix-up pass succeeded.")
+                            else:
+                                # ถ้ายังไม่ได้ ให้เติม narrative บอกสาเหตุ
+                                report["summary"]["narrative_reason"] = (
+                                    "ไม่สามารถดึงผลวิเคราะห์เชิงลึกจากโมเดลได้ในรอบนี้ "
+                                    "จึงแสดงโครงร่างตามเกณฑ์เพื่อความครบถ้วน (โปรดตรวจสอบ transcript/โมเดลอีกครั้ง)"
+                                )
+                                logging.info(f"[DEBUG] {fname} → fix-up pass failed; fallback to skeleton.")
+
+                        logging.info(f"[DEBUG] File {fname} -> steps count: {sum(len(st.get('items', [])) for st in report.get('steps', []))}")
+
+                        # 4) Score
                         scored_report, per_step_scores = compute_scores(report)
-                    except Exception as e:
-                        logging.error(f"compute_scores failed for {fname}: {e}")
-                        skip_current_file = True
-                    else:
                         bar.update(1)
 
-                if not skip_current_file:
-                    # 5) Render
-                    try:
+                        # 5) Render
                         output_file_name = f"ai_summary_{fname}"
                         final_output_file_path = os.path.join(output_dir_ai, output_file_name)
-                        render_report_to_docx(
-                            docx_path,
-                            scored_report,
-                            per_step_scores,
-                            final_output_file_path,
-                            output_dir_ai
-                        )
-                    except Exception as e:
-                        logging.error(f"render_report_to_docx failed for {fname}: {e}")
-                        skip_current_file = True
-                    else:
+                        render_report_to_docx(docx_path, scored_report, per_step_scores, final_output_file_path, output_dir_ai)
                         bar.update(1)
+
 
                 # ถ้าข้ามไฟล์ ให้ดัน progress ไปเต็มแท่งเพื่อจบ bar สวย ๆ
                 if skip_current_file:

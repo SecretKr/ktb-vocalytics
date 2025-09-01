@@ -9,6 +9,10 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from tqdm import tqdm
+from tqdm.contrib.logging import _TqdmLoggingHandler as TqdmLoggingHandler
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 # Set encoding
 try:
     locale.setlocale(locale.LC_ALL, 'th_TH.utf-8')
@@ -18,19 +22,31 @@ except locale.Error as e:
 except Exception as e:
     logging.warning(f"Unexpected error setting locale: {e}")
 
+
+# ทำให้ log แสดงสวยร่วมกับ tqdm (ขึ้นเหนือ progress bar)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[TqdmLoggingHandler()],  # << สำคัญ
+    force=True
+)
+
+# กดเสียง lib ภายนอก (ไม่ให้ HTTP 200 แทรกกลาง bar)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+
 import docx
+from docx import Document
 from docx.enum.section import WD_ORIENT, WD_SECTION
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Inches, Mm, Pt, RGBColor
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# --- Configuration & Constants ---
-
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+load_dotenv() # Ensure environment variables are loaded at the start
 
 # Status constants for scoring
 PASS_STATUSES = {"พบ"}
@@ -46,6 +62,13 @@ DECISION_GUIDE_TEXT = [
 ]
 
 # --- DOCX File Handling ---
+
+def _repeat_header_on_each_page(row):
+    tr = row._tr
+    trPr = tr.get_or_add_trPr()
+    tblHeader = OxmlElement('w:tblHeader')
+    trPr.append(tblHeader)
+
 
 def read_docx(file_path: str) -> str:
     """Reads all text content from a .docx file, including paragraphs and tables."""
@@ -92,65 +115,89 @@ def is_rate_limit_error(e: Exception) -> bool:
     return "429" in str(e)
 
 def extract_json_from_response(text: str) -> Optional[Dict]:
-    """Extracts a JSON object from a string, even if it's embedded in other text."""
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match:
-        json_str = match.group(0)
+    """
+    ดึง JSON ที่ 'ใช่' จากคำตอบโมเดล:
+    - ตัด code fences ออก
+    - ลอง parse ตรง ๆ
+    - ถ้าไม่สำเร็จ: แตกทุก {...} เป็น candidate แล้ว 'เลือกก้อนที่ดีที่สุด'
+      โดยให้คะแนนตามโครงสร้างที่เราต้องการ (steps เป็น list ไม่ว่าง + มี summary)
+    """
+    if not text:
+        return None
+
+    s = text.strip()
+    # ตัด ```...``` ออกถ้ามี
+    s = re.sub(r"^```[a-zA-Z_]*\s*", "", s).strip()
+    s = re.sub(r"\s*```$", "", s).strip()
+
+    # 1) ลอง parse ตรง ๆ ก่อน
+    try:
+        obj = json.loads(s)
+        return obj
+    except Exception:
+        pass
+
+    # 2) แตกทุก {...} เป็น candidates
+    candidates = [m.group(0) for m in re.finditer(r"\{.*?\}", s, flags=re.DOTALL)]
+    best = None
+    best_score = -1
+
+    for cand in candidates:
         try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to decode JSON from model response. Error: {e}. Raw JSON string: {json_str}")
-            return None
-    logging.warning(f"No JSON object found in model response. Raw content: {text}")
-    return None
+            obj = json.loads(cand)
+        except Exception:
+            continue
+
+        # ให้คะแนนความเหมาะสม
+        score = 0
+        steps = obj.get("steps")
+        summary = obj.get("summary")
+        if isinstance(steps, list) and len(steps) > 0:
+            score += 2        # steps เป็น list และไม่ว่าง
+            # เช็คว่า items ข้างในไม่ว่าง
+            # (ไม่บังคับเสมอไป แต่ให้แต้มเพิ่ม)
+            if any(isinstance(st.get("items"), list) and len(st.get("items")) > 0 for st in steps if isinstance(st, dict)):
+                score += 1
+        if isinstance(summary, dict):
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best = obj
+
+    return best
 
 def call_ai_model(client: OpenAI, messages: List[Dict[str, Any]], model: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
     """
-    Calls a single AI model with exponential backoff for rate limit errors.
+    เรียกโมเดลแบบเรียบง่าย + backoff 429
+    - ไม่พิมพ์เนื้อหาคำตอบลง log
+    - ไม่สร้างไฟล์ raw_ai_response.txt
     """
-    last_err = None
     retries = 0
     wait_time = 1.0
     while retries <= max_retries:
         try:
-            logging.info(f"Attempting completion with model: {model} (Attempt {retries + 1}/{max_retries + 1})")
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.1,
             )
-            content = response.choices[0].message.content
-            if content:
-                logging.info(f"Raw AI Model Response Content: {content}") # Added logging for raw content
-                # Save raw content to a file for inspection
-                with open("raw_ai_response.txt", "w", encoding="utf-8") as f:
-                    f.write(content)
-                sys.stdout.flush() # Force flush stdout
-                
-                result = extract_json_from_response(content)
-                if result:
-                    result['_model_used'] = model
-                    return result
-                else:
-                    raise ValueError(f"Model response did not contain a valid JSON object. Content: {content}")
-            else:
-                raise ValueError("Received empty content from API.")
-        
-        except Exception as e:
-            last_err = e
-            if is_rate_limit_error(e) and retries < max_retries:
-                logging.warning(f"Rate limit exceeded for model {model}. Retrying in {wait_time:.2f} seconds...")
-                time.sleep(wait_time)
-                wait_time *= 2
-                retries += 1
-            else:
-                # For other errors, we fail immediately and let the fallback handle it.
-                logging.warning(f"Failed to get a valid response from model {model}: {e}")
-                return None
-    
-    logging.error(f"All attempts failed for model {model}. Last error: {last_err}")
-    return None
+            content = (response.choices[0].message.content or "").strip()
+            result = extract_json_from_response(content)
+            if result:
+                result["_model_used"] = model
+                return result
+            # ไม่มี JSON ที่ใช้ได้
+            logging.warning(f"Model {model} returned non-JSON or invalid JSON.")
+            return None
 
+        except Exception as e:
+            if is_rate_limit_error(e) and retries < max_retries:
+                logging.warning(f"429 from {model}. Retry in {wait_time:.1f}s...")
+                time.sleep(wait_time); wait_time *= 2; retries += 1
+                continue
+            logging.warning(f"Model {model} error: {e}")
+            return None
 
 def build_comprehensive_prompt(transcript: str, criteria_data: Dict[str, Any]) -> str:
     """Builds a single, comprehensive prompt for the AI to perform all tasks at once."""
@@ -262,16 +309,69 @@ def compute_scores(report: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[int, Tu
     
     return report, per_step_scores
 
+def normalize_report(report: Dict[str, Any], criteria_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ทำให้โครงสร้าง report สมบูรณ์เสมอ:
+    - ถ้าไม่มี steps: เติมจาก criteria เป็นโครงร่างเริ่มต้น (status ว่าง)
+    - เติม summary เปล่า ๆ ถ้าขาด
+    """
+    if not isinstance(report, dict):
+        report = {}
+
+    # สร้าง steps จาก criteria ถ้าไม่มี
+    steps_ok = report.get("steps")
+    if not (isinstance(steps_ok, list) and len(steps_ok) > 0):
+        steps_new = []
+        for step_no_str, items in criteria_data.get("criteria_by_step", {}).items():
+            step_no = int(step_no_str)
+            # หา title จาก criteria_data["steps"] (map หมายเลข -> ชื่อ)
+            title = ""
+            for s in criteria_data.get("steps", []):
+                if int(s.get("step", 0)) == step_no:
+                    title = s.get("title", f"ขั้นตอน {step_no}")
+                    break
+            # สร้าง items ว่าง ๆ ตามเกณฑ์
+            new_items = []
+            for idx, item in enumerate(items, 1):
+                name = item.get("name", str(item))
+                new_items.append({
+                    "id": f"{step_no}.{idx}",
+                    "name": name,
+                    "status": "",  # ยังไม่รู้
+                    "reason": "",
+                    "evidence": {"exact": "", "sentence": "", "offset": []}
+                })
+            steps_new.append({"step": step_no, "title": title, "items": new_items})
+        # sort ตามลำดับขั้น
+        steps_new.sort(key=lambda x: int(x["step"]))
+        report["steps"] = steps_new
+
+    # ให้มี summary เสมอ
+    if not isinstance(report.get("summary"), dict):
+        report["summary"] = {
+            "compliance": {"do": [], "dont": []},
+            "narrative_reason": "",
+            "strengths": [],
+            "improvements": [],
+        }
+
+    # ให้มี metadata เสมอ
+    if not isinstance(report.get("metadata"), dict):
+        report["metadata"] = {"date": "ไม่ระบุ", "branch": "ไม่ระบุ"}
+
+    return report
+
 
 def classify_overall(report: Dict[str, Any]) -> str:
-    """Classifies the overall performance based on the score percentage."""
+    """จัดระดับจากเปอร์เซ็นต์เท่านั้น (ตามเกณฑ์หมายเหตุของผู้ใช้)"""
     summary = report.get("summary", {})
-    percent_str = summary.get("_score_percent", "0%")
-    percent = float(percent_str.replace('%', ''))
-    
-    if summary.get("compliance", {}).get("dont"):
-        return "ควรปรับปรุง"
-        
+    percent_str = str(summary.get("_score_percent", "0%")).replace('%', '').strip()
+    try:
+        percent = float(percent_str)
+    except Exception:
+        percent = 0.0
+
+    # ดีมาก >= 90, ปานกลาง 60–89, ควรปรับปรุง < 60
     if percent >= 90:
         return "ดีมาก"
     elif 60 <= percent < 90:
@@ -308,40 +408,6 @@ def _paragraph_with_text(doc, text, *, size_pt=11, bold=False, before=0, after=0
     _apply_run_font(r, size_pt=size_pt, bold=bold)
     return p
 
-
-def _make_landscape_new_section(doc):
-    """
-    แทรก section ใหม่เป็นหน้าถัดไป แล้วตั้งแนวนอน (Landscape) ให้ section นั้น
-    คืนค่า section ที่สร้าง (ให้เราเขียนรายงานในหน้านี้)
-    """
-    # เพิ่มหน้าถัดไปเป็น section ใหม่
-    sec = doc.add_section(WD_SECTION.NEW_PAGE)
-    sec.orientation = WD_ORIENT.LANDSCAPE
-    # สลับความกว้างสูง
-    new_width = sec.page_height
-    new_height = sec.page_width
-    sec.page_width = new_width
-    sec.page_height = new_height
-    return sec
-
-
-def _normalize_existing_big_titles(doc):
-    """
-    ถ้าในไฟล์เดิมมีพารากราฟชื่อ:
-      - Transcript with Highlights
-      - Match Summary
-    จะตั้งฟอนต์เป็น Tahoma 16 ให้อัตโนมัติ
-    """
-    targets = {"transcript with highlights", "match summary"}
-    for p in doc.paragraphs:
-        text = (p.text or "").strip()
-        if text.lower() in targets:
-            # เคลียร์แล้วเขียนใหม่ด้วย run เดียว (รักษาเนื้อหา)
-            p.clear()
-            r = p.add_run(text)
-            _apply_run_font(r, size_pt=16, bold=True)
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
 def _set_cell_text(cell, text, bold=False, align=WD_ALIGN_PARAGRAPH.LEFT, size=11):
     """Helper to format text within a table cell (Tahoma 11 by default)."""
     cell.text = ""
@@ -352,151 +418,287 @@ def _set_cell_text(cell, text, bold=False, align=WD_ALIGN_PARAGRAPH.LEFT, size=1
     p.paragraph_format.space_before = Pt(1)
     p.paragraph_format.space_after = Pt(1)
 
+# ---------- helpers for layout & font ----------
+
+def _ensure_tahoma_styles(doc, body_size=11, h1_size=16):
+    """เซ็ตฟอนต์เริ่มต้นทั้งเอกสารให้เป็น Tahoma (เผื่อภาษาไทย)"""
+    st = doc.styles['Normal']
+    st.font.name = "Tahoma"
+    st.font.size = Pt(body_size)
+    st._element.rPr.rFonts.set(qn('w:eastAsia'), "Tahoma")
+    st._element.rPr.rFonts.set(qn('w:ascii'), "Tahoma")
+    st._element.rPr.rFonts.set(qn('w:hAnsi'), "Tahoma")
+
+    h1 = doc.styles['Heading 1']
+    h1.font.name = "Tahoma"
+    h1.font.size = Pt(h1_size)
+    h1.font.bold = True
+    h1._element.rPr.rFonts.set(qn('w:eastAsia'), "Tahoma")
+    h1._element.rPr.rFonts.set(qn('w:ascii'), "Tahoma")
+    h1._element.rPr.rFonts.set(qn('w:hAnsi'), "Tahoma")
+
+def _printable_width(section):
+    # ความกว้างพื้นที่พิมพ์ (นิ้ว) = ความกว้างหน้า - margin ซ้าย/ขวา
+    return (section.page_width - section.left_margin - section.right_margin) / Inches(1.0)
+
+def _apply_widths_fit(tbl, widths_in, section, safety=0.88):
+    """
+    บังคับความกว้างรวมของตารางให้ <= พื้นที่พิมพ์ในหน้า (page_width - margins) * safety
+    widths_in: รายการสัดส่วน (หน่วย 'นิ้ว' ที่อยากให้เป็นก่อนสเกล) เช่น [1.2, 0.6, 1.3, 1.5, 3.2, 0.6]
+    safety: เผื่อระยะเพื่อไม่ให้ล้น (0.86–0.92)
+    """
+    page_in = section.page_width.inches
+    left_in = section.left_margin.inches
+    right_in = section.right_margin.inches
+
+    printable_in = max(0.1, page_in - left_in - right_in) * safety
+    sum_desired = sum(widths_in)
+    scale = printable_in / sum_desired if sum_desired > 0 else 1.0
+
+    # ตั้งความกว้างรวมตาราง
+    tbl.autofit = False
+    tbl.allow_autofit = False if hasattr(tbl, "allow_autofit") else None
+    tbl.preferred_width = Inches(printable_in)
+
+    # เซ็ตความกว้างแต่ละคอลัมน์
+    for j, w in enumerate(widths_in):
+        col_w = max(0.2, w * scale)  # กันคอลัมน์เล็กเกิน
+        tbl.columns[j].width = Inches(col_w)
+        for cell in tbl.columns[j].cells:
+            cell.width = Inches(col_w)
+
+def _set_table_cell_margins(table, left=50, right=50, top=30, bottom=30):
+    """
+    ปรับระยะขอบภายในเซลล์ (หน่วย: twips) ลด padding เพื่อให้ตัวอักษรมีพื้นที่เพิ่ม
+    ค่า default ค่อนข้างเล็กอยู่แล้ว แต่อาจช่วยได้มากเมื่อข้อความยาว
+    """
+    tblPr = table._tbl.tblPr
+    tblCellMar = tblPr.xpath("w:tblCellMar")
+    if tblCellMar:
+        tblCellMar = tblCellMar[0]
+    else:
+        tblCellMar = OxmlElement('w:tblCellMar')
+        tblPr.append(tblCellMar)
+
+    for side, val in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
+        elem = tblCellMar.find(qn(f'w:{side}'))
+        if elem is None:
+            elem = OxmlElement(f'w:{side}')
+            tblCellMar.append(elem)
+        elem.set(qn('w:w'), str(val))
+        elem.set(qn('w:type'), 'dxa')
+
+# ---------- render that APPENDS in LANDSCAPE and fits table ----------
+
+def _repeat_header_on_each_page(row):
+    tr = row._tr
+    trPr = tr.get_or_add_trPr()
+    tblHeader = OxmlElement('w:tblHeader')
+    trPr.append(tblHeader)
+
 def render_report_to_docx(
     original_path: str,
     report: Dict[str, Any],
     per_step_scores: Dict[int, Tuple[int, int]],
-    output_file_path: str, # New parameter for output file path
-    output_dir: str,       # New parameter for output directory
-    insert_page_break: bool = True
+    output_file_path: str,
+    output_dir: str,
 ):
-    """
-    เราจะ:
-    - เปิดไฟล์เดิม
-    - (ปรับหัวข้อ Transcript/Match Summary ในเดิมให้เป็น Tahoma 16 ถ้ามี)
-    - แทรก section ใหม่แนวนอน (Landscape)
-    - เขียนรายงานด้วย Tahoma 11 (หัวใหญ่ 16)
-    """
-    doc = docx.Document(original_path)
+    # 1) เปิดไฟล์ input + สไตล์เริ่มต้น
+    doc = Document(original_path)
+    _ensure_tahoma_styles(doc, body_size=11, h1_size=16)
 
-    # ปรับหัวข้อใหญ่ในหน้าเดิม (ถ้ามี) ให้เป็น Tahoma 16
-    _normalize_existing_big_titles(doc)
+    # 2) เพิ่ม SECTION ใหม่ (ขึ้นหน้าใหม่) และตั้งเป็น LANDSCAPE (A4)
+    new_sec = doc.add_section(WD_SECTION.NEW_PAGE)
+    new_sec.orientation = WD_ORIENT.LANDSCAPE
+    new_sec.page_width  = Mm(297)   # A4 แนวนอน
+    new_sec.page_height = Mm(210)
+    new_sec.left_margin   = Inches(0.6)
+    new_sec.right_margin  = Inches(0.6)
+    new_sec.top_margin    = Inches(0.6)
+    new_sec.bottom_margin = Inches(0.6)
 
-    # แทรกหน้าใหม่เป็น section แนวนอนสำหรับรายงาน
-    if insert_page_break:
-        _make_landscape_new_section(doc)
-    else:
-        # กรณีไม่แทรก section ใหม่ แปลง section ปัจจุบันให้เป็นแนวนอน
-        for sec in doc.sections:
-            sec.orientation = WD_ORIENT.LANDSCAPE
-            new_width = sec.page_height
-            new_height = sec.page_width
-            sec.page_width = new_width
-            sec.page_height = new_height
-
-    # --- 1) หัวรายงานใหญ่ ---
+    # 3) หัวเรื่อง
     model_name = report.get('_model_used', 'N/A')
-    big_title = f"ผลการประเมิน QA โดย AI — Model: {model_name}"
-    _paragraph_with_text(doc, big_title, size_pt=16, bold=True, after=4)
+    doc.add_paragraph(f"ผลการประเมิน QA โดย AI — Model: {model_name}", style="Heading 1")
 
-    # บันทึกหมายเหตุการคิดคะแนน/ข้อมูลพื้นฐาน เป็น Tahoma 11
-    _paragraph_with_text(doc, SCORING_LOGIC_NOTE, size_pt=11, after=2)
-
+    # 4) คำอธิบาย/เมทาดาต้า
+    doc.add_paragraph(
+        "AI จะทำการวิเคราะห์และให้คะแนนตามเกณฑ์ที่กำหนด\n"
+        "โดยคะแนนที่ได้จะถูกคำนวณจากเกณฑ์ทั้งหมด เพื่อให้ผลลัพธ์สะท้อนการทำงานได้อย่างครบถ้วน"
+    )
     date_str = report.get('metadata', {}).get('date', 'ไม่ระบุ')
     branch_str = report.get('metadata', {}).get('branch', 'ไม่ระบุ')
-    _paragraph_with_text(doc, f"วันที่:  {date_str}", size_pt=11)
-    _paragraph_with_text(doc, f"สาขา:  {branch_str}", size_pt=11)
+    doc.add_paragraph(f"วันที่: {date_str}")
+    doc.add_paragraph(f"สาขา: {branch_str}")
 
-    # --- 2) ตารางรายละเอียดรายขั้นตอน ---
-    for step in report.get("steps", []):
-        doc.add_paragraph()  # เว้นบรรทัด
-        step_no = int(step["step"])
-        title = step.get("title", f"ขั้นตอน {step_no}")
-        score = step.get("score", "N/A")
+    # 5) ตารางรายละเอียดรายขั้นตอน
+    steps = report.get("steps", [])
+    if not steps:
+        doc.add_paragraph()
+        doc.add_paragraph("หมายเหตุ: ไม่พบข้อมูลรายละเอียดขั้นตอนจากโมเดล (steps ว่าง)")
+    else:
+        for step in steps:
+            doc.add_paragraph()
+            step_no = int(step.get("step", 0))
+            title = step.get("title", f"ขั้นตอน {step_no}")
+            score = step.get("score", "0/0")
 
-        # หัวขั้นตอน (ตัวใหญ่ไม่จำเป็น 16—ใช้ 11 หนา)
-        p = doc.add_paragraph()
-        r = p.add_run(f"ขั้นตอน {step_no}) {title} — คะแนน: {score}")
-        _apply_run_font(r, size_pt=11, bold=True)
+            p = doc.add_paragraph()
+            r = p.add_run(f"ขั้นตอน {step_no}) {title} — คะแนน: {score}")
+            r.font.name = "Tahoma"; r.font.size = Pt(11); r.bold = True
 
-        _, expected = per_step_scores.get(step_no, (0, 0))
-        _paragraph_with_text(doc, f"เกณฑ์ย่อยทั้งหมด: {expected} ข้อ", size_pt=11, after=2)
+            _, expected = per_step_scores.get(step_no, (0, 0))
+            doc.add_paragraph(f"เกณฑ์ย่อยทั้งหมด: {expected} ข้อ")
 
-        detail_table = doc.add_table(rows=1, cols=6)
-        detail_table.style = "Table Grid"
-        hdr = detail_table.rows[0].cells
-        _set_cell_text(hdr[0], "Criterion", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
-        _set_cell_text(hdr[1], "Status", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
-        _set_cell_text(hdr[2], "Reason", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
-        _set_cell_text(hdr[3], "Exact", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
-        _set_cell_text(hdr[4], "Sentence", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
-        _set_cell_text(hdr[5], "Offset", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+            tbl = doc.add_table(rows=1, cols=6)
+            tbl.style = "Table Grid"
+            tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+            tbl.autofit = False
 
-        for item in step.get("items", []):
-            row = detail_table.add_row().cells
-            evidence = item.get("evidence", {}) or {}
-            _set_cell_text(row[0], item.get("name", ""), size=11)
-            _set_cell_text(row[1], item.get("status", ""), size=11)
-            _set_cell_text(row[2], item.get("reason", ""), size=11)
-            _set_cell_text(row[3], evidence.get("exact", ""), size=11)
-            _set_cell_text(row[4], evidence.get("sentence", ""), size=11)
-            offset_data = evidence.get("offset", [])
-            offset_str = ", ".join(map(str, offset_data)) if isinstance(offset_data, list) else str(offset_data)
-            _set_cell_text(row[5], offset_str, size=11)
+            # ตารางหลัก 6 คอลัมน์: Criterion, Status, Reason, Exact, Sentence, Offset
+            desired = [2.30, 0.60, 1.20, 1.90, 3.00, 0.8]  # รวม ~8.1" ก่อนสเกล
+            _apply_widths_fit(tbl, desired, new_sec, safety=0.88)
+            _set_table_cell_margins(tbl, left=40, right=40, top=20, bottom=20)
 
-        detail_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        for row in detail_table.rows:
-            for cell in row.cells:
-                cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+            def _shrink_font(cell, pt=10):
+                for p in cell.paragraphs:
+                    for r in p.runs:
+                        r.font.size = Pt(pt)
 
-    # --- 3) สรุปรวม ---
+            hdr = tbl.rows[0].cells
+            _set_cell_text(hdr[0], "Criterion", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+            _set_cell_text(hdr[1], "Status",   bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+            _set_cell_text(hdr[2], "Reason",   bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+            _set_cell_text(hdr[3], "Exact",    bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+            _set_cell_text(hdr[4], "Sentence", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+            _set_cell_text(hdr[5], "Offset",   bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+
+            # ทำให้หัวตารางซ้ำทุกหน้าเวลา table ยาว
+            _repeat_header_on_each_page(tbl.rows[0])
+
+            for it in step.get("items", []):
+                row = tbl.add_row().cells
+                ev = it.get("evidence", {}) or {}
+                _set_cell_text(row[0], it.get("name",""))
+                _set_cell_text(row[1], it.get("status",""), align=WD_ALIGN_PARAGRAPH.CENTER)
+                _set_cell_text(row[2], it.get("reason",""))
+                _set_cell_text(row[3], ev.get("exact",""))
+                _set_cell_text(row[4], ev.get("sentence",""))
+                off = ev.get("offset", [])
+                _set_cell_text(
+                    row[5],
+                    ", ".join(map(str, off)) if isinstance(off, list) else str(off),
+                    align=WD_ALIGN_PARAGRAPH.CENTER
+                )
+
+            for row in tbl.rows[1:]:
+                # Reason = col 2, Exact = col 3, Sentence = col 4 (หรือ 5 ถ้ามี Offset)
+                _shrink_font(row.cells[2], pt=10)
+                _shrink_font(row.cells[3], pt=10)
+                _shrink_font(row.cells[4], pt=10)
+
+    # 6) สรุปรวม
     doc.add_paragraph()
-    # หัว "สรุปรวม" ให้เด่น (16)
-    _paragraph_with_text(doc, "สรุปรวม", size_pt=16, bold=True, after=2)
+    p = doc.add_paragraph("สรุปรวม")
+    p.style = "Heading 1"
 
-    summary_data = report.get("summary", {})
+    # บังคับฟอนต์/ขนาด/ตัวหนา + ระยะห่างบน/ล่าง 1 บรรทัด
+    for r in p.runs:
+        r.font.name = "Tahoma"
+        r.font.size = Pt(16)
+        r.bold = True
+
+    pf = p.paragraph_format
+    pf.space_before = Pt(12)  # ~ 1 บรรทัด
+    pf.space_after  = Pt(12)  # ~ 1 บรรทัด
+
+    sumsec = report.get("summary", {}) or {}
+    tb = doc.add_table(rows=1, cols=3)
+    tb.style = "Table Grid"
+    tb.alignment = WD_TABLE_ALIGNMENT.CENTER
+    tb.autofit = False
+    _apply_widths_fit(tb, [1.00, 4.00, 1.50], new_sec, safety=0.88)
+    _set_table_cell_margins(tb, left=40, right=40, top=20, bottom=20)
+
+    h = tb.rows[0].cells
+    _set_cell_text(h[0], "Step", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _set_cell_text(h[1], "ชื่อขั้นตอน", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+    _set_cell_text(h[2], "คะแนน", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+
+    for s in steps:
+        r = tb.add_row().cells
+        _set_cell_text(r[0], s.get("step",""), align=WD_ALIGN_PARAGRAPH.CENTER)
+        _set_cell_text(r[1], s.get("title",""))
+        _set_cell_text(r[2], s.get("score",""), align=WD_ALIGN_PARAGRAPH.CENTER)
+
+    doc.add_paragraph()
+
+    p_total = doc.add_paragraph(f"คะแนนรวม: {sumsec.get('_score_total', '0/0')}")
+    # ถ้าอยากกำกับให้ไม่ชิดมากเกินไป:
+    p_total.paragraph_format.space_before = Pt(0)
+    p_total.paragraph_format.space_after  = Pt(6)
+
+    p_pct = doc.add_paragraph(f"คิดเป็นเปอร์เซ็นต์ (%): {sumsec.get('_score_percent', '0%')}")
+
     level = classify_overall(report)
+    pp = doc.add_paragraph(); rr = pp.add_run(f"การประเมินโดยรวม: {level}")
+    rr.font.name = "Tahoma"; rr.font.size = Pt(11); rr.bold = True
 
-    # ตารางสรุปคะแนนรายขั้นตอน
-    _paragraph_with_text(doc, "สรุปคะแนนรายขั้นตอน:", size_pt=11, bold=True, after=2)
-    score_table = doc.add_table(rows=1, cols=3)
-    score_table.style = "Table Grid"
-    hdr_cells = score_table.rows[0].cells
-    _set_cell_text(hdr_cells[0], "Step", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
-    _set_cell_text(hdr_cells[1], "ชื่อขั้นตอน", bold=True)
-    _set_cell_text(hdr_cells[2], "คะแนน", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
+    reason = (sumsec.get("narrative_reason") or "").strip()
+    if reason:
+        p = doc.add_paragraph("เหตุผลการจัดระดับ")
+        for r in p.runs:
+            r.font.name = "Tahoma"; r.font.size = Pt(12); r.bold = True
+        p.paragraph_format.space_before = Pt(10)
+        p.paragraph_format.space_after = Pt(4)
 
-    for step in report.get("steps", []):
-        row_cells = score_table.add_row().cells
-        _set_cell_text(row_cells[0], step.get("step", ""), align=WD_ALIGN_PARAGRAPH.CENTER)
-        _set_cell_text(row_cells[1], step.get("title", ""))
-        _set_cell_text(row_cells[2], step.get("score", ""), align=WD_ALIGN_PARAGRAPH.CENTER)
+        p_body = doc.add_paragraph(reason)
+        for r in p_body.runs:
+            r.font.name = "Tahoma"; r.font.size = Pt(11)
 
-    score_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    # จุดเด่น
+    strengths = sumsec.get("strengths") or []
+    if strengths:
+        p = doc.add_paragraph("จุดเด่น")
+        for r in p.runs:
+            r.font.name = "Tahoma"; r.font.size = Pt(12); r.bold = True
+        p.paragraph_format.space_before = Pt(10)
+        p.paragraph_format.space_after = Pt(4)
+
+        for s in strengths:
+            p_b = doc.add_paragraph(s, style="List Bullet")
+            for r in p_b.runs: r.font.name = "Tahoma"; r.font.size = Pt(11)
+
+    # ควรปรับปรุง
+    improvements = sumsec.get("improvements") or []
+    if improvements:
+        p = doc.add_paragraph("ควรปรับปรุง")
+        for r in p.runs:
+            r.font.name = "Tahoma"; r.font.size = Pt(12); r.bold = True
+        p.paragraph_format.space_before = Pt(10)
+        p.paragraph_format.space_after = Pt(4)
+
+        for s in improvements:
+            p_b = doc.add_paragraph(s, style="List Bullet")
+            for r in p_b.runs: r.font.name = "Tahoma"; r.font.size = Pt(11)
+
 
     doc.add_paragraph()
-    _paragraph_with_text(doc, f"คะแนนรวม:  {summary_data.get('_score_total', 'N/A')}", size_pt=11)
-    _paragraph_with_text(doc, f"คิดเป็นเปอร์เซ็นต์ (%):  {summary_data.get('_score_percent', 'N/A')}", size_pt=11)
-    _paragraph_with_text(doc, f"การประเมินโดยรวม:  {level}", size_pt=11, bold=True)
+    p_note = doc.add_paragraph()
+    run_note = p_note.add_run("หมายเหตุ: ตัวอย่างการตัดสินใจของ AI")
+    run_note.bold = True
+    run_note.font.name = "Tahoma"
+    run_note.font.size = Pt(11)
 
-    # เหตุผล/จุดเด่น/ควรปรับปรุง จาก JSON (ถ้ามี)
-    if (narrative := summary_data.get("narrative_reason")):
-        p = doc.add_paragraph()
-        r1 = p.add_run("เหตุผลประกอบการจัดระดับ:  ")
-        _apply_run_font(r1, size_pt=11, bold=True)
-        r2 = p.add_run(narrative)
-        _apply_run_font(r2, size_pt=11)
-
-    if strengths := summary_data.get("strengths"):
-        _paragraph_with_text(doc, "จุดเด่น:", size_pt=11, bold=True)
-        for item in strengths:
-            _paragraph_with_text(doc, f"• {item}", size_pt=11)
-
-    if improvements := summary_data.get("improvements"):
-        _paragraph_with_text(doc, "ควรปรับปรุง:", size_pt=11, bold=True)
-        for item in improvements:
-            _paragraph_with_text(doc, f"• {item}", size_pt=11)
-
-    doc.add_paragraph()
-    # หมายเหตุ (เกณฑ์ตัวอย่าง) — แสดงเป็นคู่มือ ไม่ใช้เป็นเหตุผลจัดระดับ
-    _paragraph_with_text(doc, "หมายเหตุ: ตัวอย่างการตัดสินใจของ AI", size_pt=11, bold=True)
+    # ตามด้วย bullet/บรรทัด “ตัวอย่างการตัดสินใจ...” ของคุณเหมือนเดิม
     for line in DECISION_GUIDE_TEXT:
-        _paragraph_with_text(doc, f"• {line}", size_pt=11)
+        doc.add_paragraph(f"• {line}")
 
-    os.makedirs(output_dir, exist_ok=True) # Create output directory if it doesn't exist
-    doc.save(output_file_path)
-    logging.info(f"Successfully rendered report (Landscape + Tahoma) to {output_file_path}")
-
+    # 7) save แบบปลอดภัย
+    os.makedirs(output_dir, exist_ok=True)
+    tmp = output_file_path + ".tmp"
+    doc.save(tmp)
+    os.replace(tmp, output_file_path)
 
 # --- Main Execution Logic ---
 
@@ -519,9 +721,11 @@ def main():
         logging.error(e)
         return
 
-    input_path = os.path.join(os.path.dirname(__file__), args.input_dir, args.product) # Adjusted input path
-    output_dir_ai = os.path.join(args.output_dir, f"{args.product}_final_output") # Adjusted output directory for AI summary
+    input_path = os.path.join(os.path.dirname(__file__), args.input_dir, args.product)
     
+    output_dir_ai = os.path.join(args.output_dir, f"{args.product}_final_output")
+    os.makedirs(output_dir_ai, exist_ok=True)
+
     files = glob.glob(os.path.join(input_path, "*.docx"))
     files = [f for f in files if not os.path.basename(f).startswith("~$")]
 
@@ -529,41 +733,110 @@ def main():
         logging.warning(f"No .docx files found in '{input_path}'.")
         return
 
-    for docx_path in files:
-        logging.info(f"--- Processing file: {os.path.basename(docx_path)} ---")
-        transcript = read_docx(docx_path)
-        if not transcript.strip():
-            logging.warning("Skipping empty transcript.")
-            continue
+    primary_model = args.model
+    fallback_model = args.fallback_model
+    model_list = [m for m in [primary_model, fallback_model] if m]
 
-        comprehensive_prompt = build_comprehensive_prompt(transcript, criteria_data)
-        
-        report = None
-        for model in models:
-            report = call_ai_model(client, [{"role": "user", "content": comprehensive_prompt}], model)
-            if report:
-                logging.info(f"Successfully received valid report from model: {model}")
-                break
+    steps = ["Load transcript", "Build prompt", "Call AI", "Score", "Render"]
+
+    with logging_redirect_tqdm():
+        total = len(files)
+        for idx, docx_path in enumerate(files, start=1):
+            fname = os.path.basename(docx_path)
+
+            logging.info("\n" + "-"*100)
+            logging.info(f"▶ Processing file {idx}/{total}: {fname}")
+            logging.info("-"*100)
+            logging.info("-"*100 + "\n")
+
+            t0 = time.time()
+            final_output_file_path = None
+            skip_current_file = False  # <-- ต้องเริ่มต้นตรงนี้ทุกไฟล์
+
+            steps = ["Load transcript", "Build prompt", "Call AI", "Score", "Render"]
+            with tqdm(total=len(steps), desc=f"[{idx}/{total}] {fname}", unit="step", leave=True) as bar:
+
+                # 1) Load transcript
+                transcript = read_docx(docx_path)
+                bar.update(1)
+
+                if not transcript or not transcript.strip():
+                    logging.warning(f"Skipping empty transcript: {fname}")
+                    skip_current_file = True
+
+                if not skip_current_file:
+                    # 2) Build prompt
+                    prompt = build_comprehensive_prompt(transcript, criteria_data)
+                    bar.update(1)
+
+                    # 3) Call AI (อัปเดต postfix แสดงรุ่นที่ใช้)
+                    report = None
+                    for model in models:
+                        bar.set_postfix(model=model)
+                        report = call_ai_model(
+                            client,
+                            [{"role": "user", "content": prompt}],
+                            model
+                        )
+                        if report:
+                            break
+                    bar.update(1)
+
+                    if not report:
+                        logging.error(f"All models failed for: {fname}")
+                        skip_current_file = True
+
+                if not skip_current_file:
+                    # 3.5) Normalize โครงสร้าง report กัน steps ว่าง
+                    try:
+                        report = normalize_report(report, criteria_data)
+                    except Exception as e:
+                        logging.error(f"normalize_report failed for {fname}: {e}")
+                        skip_current_file = True
+
+                if not skip_current_file:
+                    # 4) Score
+                    try:
+                        scored_report, per_step_scores = compute_scores(report)
+                    except Exception as e:
+                        logging.error(f"compute_scores failed for {fname}: {e}")
+                        skip_current_file = True
+                    else:
+                        bar.update(1)
+
+                if not skip_current_file:
+                    # 5) Render
+                    try:
+                        output_file_name = f"ai_summary_{fname}"
+                        final_output_file_path = os.path.join(output_dir_ai, output_file_name)
+                        render_report_to_docx(
+                            docx_path,
+                            scored_report,
+                            per_step_scores,
+                            final_output_file_path,
+                            output_dir_ai
+                        )
+                    except Exception as e:
+                        logging.error(f"render_report_to_docx failed for {fname}: {e}")
+                        skip_current_file = True
+                    else:
+                        bar.update(1)
+
+                # ถ้าข้ามไฟล์ ให้ดัน progress ไปเต็มแท่งเพื่อจบ bar สวย ๆ
+                if skip_current_file:
+                    if bar.n < bar.total:
+                        bar.update(bar.total - bar.n)
+
+            # ออกจาก with tqdm แล้วค่อยสรุปสถานะไฟล์นี้
+            if skip_current_file:
+                logging.info(f"⏭ Skipped: {fname}")
             else:
-                logging.warning(f"Model {model} failed. Trying next model in the list...")
-
-        if not report:
-            logging.error(f"Failed to get a complete report from AI for {docx_path} after trying all models. Skipping.")
-            continue
-
-        # --- Scoring and Rendering ---
-        scored_report, per_step_scores = compute_scores(report)
-        
-        # Add a log to inspect the scored_report content
-        logging.info(f"Scored Report Content for {os.path.basename(docx_path)}: {json.dumps(scored_report, ensure_ascii=False, indent=2)}")
-        
-        # Generate new output file path for AI summary
-        output_file_name = f"ai_summary_{os.path.basename(docx_path)}"
-        final_output_file_path = os.path.join(output_dir_ai, output_file_name)
-
-        render_report_to_docx(docx_path, scored_report, per_step_scores, final_output_file_path, output_dir_ai)
-        logging.info(f"--- Finished processing {os.path.basename(docx_path)} ---")
-
+                elapsed = (time.time() - t0) / 60
+                # กัน None ถ้าเผื่อไม่มีค่า (ไม่ควรเกิด เพราะ not skip แล้ว)
+                final_output_file_path = final_output_file_path or "(no output path)"
+                logging.info(
+                    f"✅ Completed: {fname} -> {final_output_file_path} | elapsed {elapsed:.2f} min"
+                )
 
 if __name__ == "__main__":
     main()

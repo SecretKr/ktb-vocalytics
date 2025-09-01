@@ -309,58 +309,105 @@ def compute_scores(report: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[int, Tu
     
     return report, per_step_scores
 
-def normalize_report(report: Dict[str, Any], criteria_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    ทำให้โครงสร้าง report สมบูรณ์เสมอ:
-    - ถ้าไม่มี steps: เติมจาก criteria เป็นโครงร่างเริ่มต้น (status ว่าง)
-    - เติม summary เปล่า ๆ ถ้าขาด
-    """
-    if not isinstance(report, dict):
-        report = {}
+def normalize_report(report, criteria_data):
+    summary = report.get("summary") or {}
 
-    # สร้าง steps จาก criteria ถ้าไม่มี
-    steps_ok = report.get("steps")
-    if not (isinstance(steps_ok, list) and len(steps_ok) > 0):
-        steps_new = []
-        for step_no_str, items in criteria_data.get("criteria_by_step", {}).items():
-            step_no = int(step_no_str)
-            # หา title จาก criteria_data["steps"] (map หมายเลข -> ชื่อ)
-            title = ""
-            for s in criteria_data.get("steps", []):
-                if int(s.get("step", 0)) == step_no:
-                    title = s.get("title", f"ขั้นตอน {step_no}")
-                    break
-            # สร้าง items ว่าง ๆ ตามเกณฑ์
-            new_items = []
-            for idx, item in enumerate(items, 1):
-                name = item.get("name", str(item))
-                new_items.append({
-                    "id": f"{step_no}.{idx}",
-                    "name": name,
-                    "status": "",  # ยังไม่รู้
-                    "reason": "",
-                    "evidence": {"exact": "", "sentence": "", "offset": []}
-                })
-            steps_new.append({"step": step_no, "title": title, "items": new_items})
-        # sort ตามลำดับขั้น
-        steps_new.sort(key=lambda x: int(x["step"]))
-        report["steps"] = steps_new
+    # กำหนด default
+    summary.setdefault("narrative_reason", "")
+    summary.setdefault("strengths", [])
+    summary.setdefault("improvements", [])
+    summary.setdefault("compliance", {"do": [], "dont": []})
 
-    # ให้มี summary เสมอ
-    if not isinstance(report.get("summary"), dict):
-        report["summary"] = {
-            "compliance": {"do": [], "dont": []},
-            "narrative_reason": "",
-            "strengths": [],
-            "improvements": [],
-        }
+    # ถ้า strengths/improvements เป็น string → list
+    for key in ("strengths", "improvements"):
+        val = summary.get(key)
+        if isinstance(val, str):
+            summary[key] = [s.strip() for s in val.split("\n") if s.strip()]
+        elif not isinstance(val, list):
+            summary[key] = []
 
-    # ให้มี metadata เสมอ
-    if not isinstance(report.get("metadata"), dict):
-        report["metadata"] = {"date": "ไม่ระบุ", "branch": "ไม่ระบุ"}
+    # ถ้า compliance.do/dont ไม่ใช่ list → list
+    comp = summary.get("compliance") or {}
+    for k in ("do", "dont"):
+        v = comp.get(k, [])
+        if isinstance(v, str):
+            comp[k] = [s.strip() for s in v.split("\n") if s.strip()]
+        elif not isinstance(v, list):
+            comp[k] = []
+    summary["compliance"] = comp
+
+    report["summary"] = summary
+
+        # --- บังคับ steps ให้เป็น list ---
+    steps = report.get("steps")
+    if not isinstance(steps, list):
+        steps = []
+    else:
+        # --- สำคัญ: บังคับ items ของแต่ละ step ให้เป็น 'list' เสมอ ---
+        fixed_steps = []
+        for i, st in enumerate(steps):
+            if not isinstance(st, dict):
+                # โครงสร้าง step แปลก → ข้าม
+                continue
+
+            items = st.get("items", [])
+            # ถ้า items เป็น string → พยายาม parse เป็น JSON ก่อน
+            if isinstance(items, str):
+                parsed = None
+                try:
+                    parsed = json.loads(items)
+                except Exception:
+                    parsed = None
+
+                if isinstance(parsed, list):
+                    items = parsed
+                elif isinstance(parsed, dict):
+                    items = [parsed]
+                else:
+                    # แปลง string (ที่ parse ไม่ได้) ให้เป็น list ว่าง
+                    items = []
+
+            # ถ้า items เป็น dict เดี่ยว → หุ้มเป็น list
+            elif isinstance(items, dict):
+                items = [items]
+
+            # ถ้าไม่ใช่ list → บังคับเป็น list ว่าง
+            elif not isinstance(items, list):
+                items = []
+
+            # optional: ทำความสะอาด structure ของ item แต่ละตัว
+            fixed_items = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                ev = it.get("evidence") or {}
+                if isinstance(ev, str):
+                    # พยายาม parse evidence ถ้าเป็น string-JSON
+                    try:
+                        ev_parsed = json.loads(ev)
+                        ev = ev_parsed if isinstance(ev_parsed, dict) else {}
+                    except Exception:
+                        ev = {}
+                elif not isinstance(ev, dict):
+                    ev = {}
+
+                it.setdefault("id", "")
+                it.setdefault("name", "")
+                it.setdefault("status", "")
+                it.setdefault("reason", "")
+                it["evidence"] = ev
+                fixed_items.append(it)
+
+            st.setdefault("step", st.get("step", 0))
+            st.setdefault("title", st.get("title", f"ขั้นตอน {st.get('step', 0)}"))
+            st["items"] = fixed_items
+            fixed_steps.append(st)
+
+        steps = fixed_steps
+
+    report["steps"] = steps
 
     return report
-
 
 def classify_overall(report: Dict[str, Any]) -> str:
     """จัดระดับจากเปอร์เซ็นต์เท่านั้น (ตามเกณฑ์หมายเหตุของผู้ใช้)"""
@@ -417,6 +464,12 @@ def _set_cell_text(cell, text, bold=False, align=WD_ALIGN_PARAGRAPH.LEFT, size=1
     _apply_run_font(run, size_pt=size, bold=bold)
     p.paragraph_format.space_before = Pt(1)
     p.paragraph_format.space_after = Pt(1)
+
+def _shrink_font(cell, pt):
+    """Shrinks the font size of the text in a cell."""
+    for paragraph in cell.paragraphs:
+        for run in paragraph.runs:
+            _apply_run_font(run, size_pt=pt)
 
 # ---------- helpers for layout & font ----------
 
@@ -490,12 +543,6 @@ def _set_table_cell_margins(table, left=50, right=50, top=30, bottom=30):
 
 # ---------- render that APPENDS in LANDSCAPE and fits table ----------
 
-def _repeat_header_on_each_page(row):
-    tr = row._tr
-    trPr = tr.get_or_add_trPr()
-    tblHeader = OxmlElement('w:tblHeader')
-    trPr.append(tblHeader)
-
 def render_report_to_docx(
     original_path: str,
     report: Dict[str, Any],
@@ -534,7 +581,6 @@ def render_report_to_docx(
     # 5) ตารางรายละเอียดรายขั้นตอน
     steps = report.get("steps", [])
     if not steps:
-        doc.add_paragraph()
         doc.add_paragraph("หมายเหตุ: ไม่พบข้อมูลรายละเอียดขั้นตอนจากโมเดล (steps ว่าง)")
     else:
         for step in steps:
@@ -555,15 +601,8 @@ def render_report_to_docx(
             tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
             tbl.autofit = False
 
-            # ตารางหลัก 6 คอลัมน์: Criterion, Status, Reason, Exact, Sentence, Offset
-            desired = [2.30, 0.60, 1.20, 1.90, 3.00, 0.8]  # รวม ~8.1" ก่อนสเกล
-            _apply_widths_fit(tbl, desired, new_sec, safety=0.88)
-            _set_table_cell_margins(tbl, left=40, right=40, top=20, bottom=20)
-
-            def _shrink_font(cell, pt=10):
-                for p in cell.paragraphs:
-                    for r in p.runs:
-                        r.font.size = Pt(pt)
+            desired = [1.4, 0.75, 1.4, 1.6, 4.1, 0.75]
+            _apply_widths_fit(tbl, desired, new_sec, safety=0.92)
 
             hdr = tbl.rows[0].cells
             _set_cell_text(hdr[0], "Criterion", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
@@ -573,23 +612,33 @@ def render_report_to_docx(
             _set_cell_text(hdr[4], "Sentence", bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
             _set_cell_text(hdr[5], "Offset",   bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
 
-            # ทำให้หัวตารางซ้ำทุกหน้าเวลา table ยาว
-            _repeat_header_on_each_page(tbl.rows[0])
+            # --- ใช้ตัวแปร items เดียวกันทั้ง loop และ fallback ---
+            items = step.get("items", [])
+            if not isinstance(items, list):
+                # กันเคสที่ normalize หลุด/หรือ report มาจากไฟล์เก่า
+                items = []
 
-            for it in step.get("items", []):
+            if not items:
+                # ไม่มี item เลย → เพิ่มแถว placeholder
                 row = tbl.add_row().cells
-                ev = it.get("evidence", {}) or {}
-                _set_cell_text(row[0], it.get("name",""))
-                _set_cell_text(row[1], it.get("status",""), align=WD_ALIGN_PARAGRAPH.CENTER)
-                _set_cell_text(row[2], it.get("reason",""))
-                _set_cell_text(row[3], ev.get("exact",""))
-                _set_cell_text(row[4], ev.get("sentence",""))
-                off = ev.get("offset", [])
-                _set_cell_text(
-                    row[5],
-                    ", ".join(map(str, off)) if isinstance(off, list) else str(off),
-                    align=WD_ALIGN_PARAGRAPH.CENTER
-                )
+                _set_cell_text(row[0], "(ไม่มีข้อมูล)", align=WD_ALIGN_PARAGRAPH.CENTER)
+                for j in range(1, 6):
+                    _set_cell_text(row[j], "-", align=WD_ALIGN_PARAGRAPH.CENTER)
+            else:
+                for it in items:
+                    row = tbl.add_row().cells
+                    ev = it.get("evidence", {}) or {}
+                    _set_cell_text(row[0], it.get("name",""))
+                    _set_cell_text(row[1], it.get("status",""), align=WD_ALIGN_PARAGRAPH.CENTER)
+                    _set_cell_text(row[2], it.get("reason",""))
+                    _set_cell_text(row[3], ev.get("exact",""))
+                    _set_cell_text(row[4], ev.get("sentence",""))
+                    off = ev.get("offset", [])
+                    _set_cell_text(
+                        row[5],
+                        ", ".join(map(str, off)) if isinstance(off, list) else str(off),
+                        align=WD_ALIGN_PARAGRAPH.CENTER
+                    )
 
             for row in tbl.rows[1:]:
                 # Reason = col 2, Exact = col 3, Sentence = col 4 (หรือ 5 ถ้ามี Offset)
@@ -786,15 +835,16 @@ def main():
                         logging.error(f"All models failed for: {fname}")
                         skip_current_file = True
 
-                if not skip_current_file:
-                    # 3.5) Normalize โครงสร้าง report กัน steps ว่าง
+                if not isinstance(report, dict):
                     try:
-                        report = normalize_report(report, criteria_data)
+                        report = json.loads(report)  # แปลง string → dict
                     except Exception as e:
-                        logging.error(f"normalize_report failed for {fname}: {e}")
+                        logging.error(f"❌ JSON parse failed for {fname}: {e}")
                         skip_current_file = True
+                        continue
 
                 if not skip_current_file:
+                    logging.info(f"[DEBUG] File {fname} -> steps count: {len(report.get('steps', []))}")
                     # 4) Score
                     try:
                         scored_report, per_step_scores = compute_scores(report)

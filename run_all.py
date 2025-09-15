@@ -22,7 +22,7 @@ def find_transcripts(product: str, base_dir: str = "transcript"):
     return prod_dir, files
 
 def ensure_output_dirs(product: str):
-    """สร้างโฟลเดอร์เอาต์พุตที่ใช้ในสองสเต็ปนี้ ถ้ายังไม่มี"""
+    """สร้างโฟลเดอร์ output ที่ใช้ในสอง step นี้ ถ้ายังไม่มี"""
     highlight_dir = os.path.join("transcript_with_highlight", product)
     final_dir = os.path.join("transcript_with_highlight_and_ai_summarize", f"{product}_final_output")
     os.makedirs(highlight_dir, exist_ok=True)

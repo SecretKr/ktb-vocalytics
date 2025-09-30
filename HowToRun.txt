@@ -1,0 +1,20 @@
+วิธีการรันโค้ด:
+เตรียมสภาพแวดล้อม (ครั้งละรอบก่อนรัน)
+1. เปิด Terminal (Command Prompt)
+2. เปิดใช้งาน Conda environment (ปรับเปลี่ยน path ตามเครื่องของคุณ): > C:/Users/Deede/anaconda3/Scripts/activate
+3. เปิดใช้งาน Conda environment (ปรับเปลี่ยน env ตามเครื่องของคุณ): > conda activate ktb
+
+A) รันสคริปต์ 2: keyword_highlight.py
+- รัน “ทุกไฟล์” ของ product debit_card
+  >> for %f in ("transcript\debit_card\*.txt") do ^ python "2 keyword_highlight.py" --product debit_card --transcript_filename "%~nxf"
+- รัน “เฉพาะบางไฟล์” (ตัวอย่าง 2 ไฟล์)
+  >> for %f in ("transcript\debit_card\call_001.txt" "transcript\debit_card\call_007.txt") do ^ python "2 keyword_highlight.py" --product debit_card --transcript_filename "%~nxf"
+
+B) รันสคริปต์ 2: 3 ai_summarizer.py (อ่านไฟล์ .docx ที่ไฮไลต์แล้วจาก <input-dir>\<product>\*.docx)
+- รัน “ทุกไฟล์” ของ product debit_card
+  >> python "3 ai_summarizer.py" --product debit_card --input-dir transcript_with_highlight
+- รัน “เฉพาะบางไฟล์” ของ product debit_card
+  >> python "3 ai_summarizer.py" --product debit_card --input-dir transcript_with_highlight --only "transcript_with_highlight\debit_card\call_001.docx"
+
+C) รันสคริปต์ 3: run_all.py รัน “สองสเต็ปติดกัน” ครั้งเดียว (ไฮไลต์ → สรุป)
+  >> python run_all.py --product debit_card

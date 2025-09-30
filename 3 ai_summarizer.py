@@ -15,8 +15,8 @@ import docx  # สำหรับสร้างและแก้ไขไฟ�
 from docx import Document  # คลาส Document จาก docx สำหรับสร้างเอกสาร
 from docx.enum.section import (  # สำหรับกำหนดทิศทางและประเภทของ section ในเอกสาร
     WD_ORIENT, WD_SECTION)
-from docx.enum.table import (WD_ALIGN_VERTICAL,  # สำหรับกำหนดการจัดแนวตาราง
-                             WD_TABLE_ALIGNMENT)
+from docx.enum.table import WD_ALIGN_VERTICAL  # สำหรับกำหนดการจัดแนวตาราง
+from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import \
     WD_ALIGN_PARAGRAPH  # สำหรับกำหนดการจัดแนวข้อความใน paragraph
 from docx.oxml import OxmlElement  # สำหรับทำงานกับ XML ภายในไฟล์ .docx
@@ -708,7 +708,7 @@ def build_run_metadata(product: str, criteria_dir: str, output_file_path: str, v
         "objective": FIXED_METADATA["objective"],
         "control_code": FIXED_METADATA["control_code"],
         "file_name": file_name,
-        "data_used": ", ".join(used_data),
+        "data_used": "\n".join(used_data), # เปลี่ยนเป็น join ด้วย newline
         "run_date": run_date,
     }
 
@@ -796,7 +796,7 @@ def render_report_to_docx(
     # *** เพิ่มส่วนนี้: สร้างและแทรกตารางบนสุด ***
     # สร้าง metadata สำหรับตารางบน
     meta = build_run_metadata(
-        product="debit_card",  # หรือใช้ตัวแปรจาก argument # กำหนดชื่อผลิตภัณฑ์
+        product=product_name,  # ใช้ product_name จาก argument
         criteria_dir="criteria",
         output_file_path=output_file_path,
         voice_file=None
@@ -1055,9 +1055,6 @@ def render_report_to_docx(
 # --- Main Execution Logic ---
 
 def main():
-    """
-    ฟังก์ชันหลักสำหรับรันโปรแกรม AI-Powered QA Summarizer
-    """
     parser = argparse.ArgumentParser(description="AI-Powered QA Summarizer for Call Transcripts") # สร้าง ArgumentParser
     parser.add_argument("--product", required=True, help="Product name matching the criteria JSON file (e.g., 'debit_card')") # เพิ่ม argument สำหรับชื่อผลิตภัณฑ์
     parser.add_argument("--criteria-dir", default="criteria", help="Directory containing criteria JSON files") # เพิ่ม argument สำหรับ directory เกณฑ์

@@ -17,3 +17,14 @@ transcript_with_highlight/**
 
 transcript_with_highlight_and_ai_summarize/**
 !transcript_with_highlight_and_ai_summarize/.gitkeep
+
+# Python-specific ignores
+__pycache__/
+*.pyc
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Log and temporary files
+*.log
+*.tmp

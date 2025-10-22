@@ -9,11 +9,14 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 # === Config ===
-PRODUCT_NAME = "debit_card"  # Default product, will be updated dynamically
-TRANSCRIPT_DIR = "C:/Users/Deede/Projects/ktb-vocalytics/transcript"
-KEYWORDS_DIR = "C:/Users/Deede/Projects/ktb-vocalytics/keywords"
-OUTPUT_BASE_DIR = "C:/Users/Deede/Projects/ktb-vocalytics/transcript_with_highlight"
-OUTPUT_AI_BASE_DIR = "C:/Users/Deede/Projects/ktb-vocalytics/transcript_with_highlight_and_ai_summarize"
+
+# ใช้ os.path.dirname(__file__) เพื่ออ้างอิงจากที่อยู่ของไฟล์สคริปต์
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+TRANSCRIPT_DIR = os.path.join(BASE_DIR, "transcript")
+KEYWORDS_DIR = os.path.join(BASE_DIR, "keywords")
+OUTPUT_BASE_DIR = os.path.join(BASE_DIR, "transcript_with_highlight")
+OUTPUT_AI_BASE_DIR = os.path.join(BASE_DIR, "transcript_with_highlight_and_ai_summarize")
 
 DOC_TITLE = 'Transcript with Highlights'
 GROUP_NAME_COL = 1
@@ -226,7 +229,7 @@ def create_docx_and_highlight(full_text, keyword_groups, output_file_path, outpu
 def insert_summary_table(document, summary_data):
     document.add_page_break()
     
-    heading = document.add_heading('Match Summary', level=1)
+    heading = document.add_heading('ตรวจสอบโดยใช้ Keyword', level=1)
     heading.runs[0].font.size = Pt(16)
     heading.runs[0].font.name = 'Tahoma'
     
@@ -308,3 +311,4 @@ if __name__ == '__main__':
     keyword_groups = load_keyword_patterns(keywords_file_path)
     summary_result = create_docx_and_highlight(full_text, keyword_groups, output_file_path, output_dir)
     print_summary_table(summary_result)
+
